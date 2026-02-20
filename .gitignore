@@ -4,3 +4,4 @@
 *.md
 *.lock
 qbdi/libQBDI.a
+loader/loader_check.o

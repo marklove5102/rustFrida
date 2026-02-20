@@ -6,6 +6,10 @@ use clap::Parser;
 use libc::{bind, listen, sleep, sockaddr_un, AF_UNIX, SOCK_STREAM};
 use libc::{c_int, c_void, close, connect, free, iovec, malloc, mmap, mprotect, munmap, pid_t, pthread_create, pthread_detach, recvmsg, socket, write, PTRACE_CONT, PTRACE_GETREGSET, PTRACE_SETREGSET};
 use libc::{strlen, dlopen, dlsym, dlerror, memcpy, memfd_create, snprintf, write as libc_write, MFD_CLOEXEC};
+
+extern "C" {
+    fn android_dlopen_ext(filename: *const std::os::raw::c_char, flag: c_int, extinfo: *const c_void) -> *mut c_void;
+}
 use nix::errno::Errno;
 use nix::sys::ptrace;
 use nix::sys::signal::Signal;
@@ -212,7 +216,8 @@ define_libc_functions!(
 define_dl_functions!(
     dlopen,    // 动态加载
     dlsym,      // 动态符号查找
-    dlerror
+    dlerror,
+    android_dlopen_ext  // fd-based dlopen (绕过 SELinux)
 );
 
 /// 用户空间寄存器结构体

