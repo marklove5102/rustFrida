@@ -9,23 +9,6 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
 
-/// Diagnostic logger via __android_log_write (liblog.so).
-/// Always visible in `adb logcat -s HOOK_DBG` regardless of process UID.
-unsafe fn hcw_log(msg: &[u8]) {
-    extern "C" {
-        fn __android_log_write(prio: i32, tag: *const libc::c_char, text: *const libc::c_char)
-            -> i32;
-    }
-    // Build a null-terminated copy (msg may not be null-terminated or may have a trailing \n).
-    let mut buf: Vec<u8> = Vec::with_capacity(msg.len() + 1);
-    // Strip trailing newline for cleaner logcat output.
-    let trimmed = if msg.last() == Some(&b'\n') { &msg[..msg.len() - 1] } else { msg };
-    buf.extend_from_slice(trimmed);
-    buf.push(0);
-    // prio 3 = ANDROID_LOG_DEBUG
-    __android_log_write(3, b"HOOK_DBG\0".as_ptr() as *const libc::c_char, buf.as_ptr() as *const libc::c_char);
-}
-
 // Error codes from hook_engine.h
 const HOOK_OK: i32 = 0;
 const HOOK_ERROR_NOT_INITIALIZED: i32 = -1;
@@ -76,22 +59,32 @@ fn init_registry() {
     }
 }
 
+/// Check if [addr, addr+size) is accessible using mincore(2).
+fn is_addr_accessible(addr: u64, size: usize) -> bool {
+    if addr == 0 || size == 0 {
+        return false;
+    }
+    unsafe {
+        const PAGE_SIZE: usize = 0x1000;
+        let page_addr = (addr as usize) & !(PAGE_SIZE - 1);
+        let end = (addr as usize).wrapping_add(size);
+        let region_len = end.saturating_sub(page_addr);
+        let pages = (region_len + PAGE_SIZE - 1) / PAGE_SIZE;
+        let mut vec = vec![0u8; pages];
+        libc::mincore(
+            page_addr as *mut libc::c_void,
+            region_len,
+            vec.as_mut_ptr() as *mut _,
+        ) == 0
+    }
+}
+
 /// Hook callback that calls the JS function
 unsafe extern "C" fn hook_callback_wrapper(
     ctx_ptr: *mut hook_ffi::HookContext,
     user_data: *mut std::ffi::c_void,
 ) {
-    // [DBG-1] Thunk reached Rust — log entry with raw pointer values.
-    {
-        let msg = format!(
-            "[HCW-1] entered: ctx_ptr={:p} user_data={:p}\n",
-            ctx_ptr, user_data
-        );
-        hcw_log(msg.as_bytes());
-    }
-
     if ctx_ptr.is_null() || user_data.is_null() {
-        hcw_log(b"[HCW-1E] null ptr, returning\n");
         return;
     }
 
@@ -102,45 +95,18 @@ unsafe extern "C" fn hook_callback_wrapper(
     // itself tries to hook/unhook. Also avoids holding a lock during potentially
     // blocking QuickJS execution.
     let (ctx_usize, callback_bytes) = {
-        // [DBG-2] About to lock HOOK_REGISTRY
-        hcw_log(b"[HCW-2] locking registry\n");
         let guard = match HOOK_REGISTRY.lock() {
             Ok(g) => g,
-            Err(_) => {
-                hcw_log(b"[HCW-2E] mutex poisoned\n");
-                return;
-            }
+            Err(_) => return,
         };
         let registry = match guard.as_ref() {
             Some(r) => r,
-            None => {
-                hcw_log(b"[HCW-2E] registry is None\n");
-                return;
-            }
+            None => return,
         };
-        // [DBG-3] Log registry size and lookup key
-        {
-            let msg = format!(
-                "[HCW-3] registry len={} lookup key={:#x}\n",
-                registry.len(),
-                target_addr
-            );
-            hcw_log(msg.as_bytes());
-        }
         let hook_data = match registry.get(&target_addr) {
             Some(d) => d,
-            None => {
-                // Log all keys present to spot any address mismatch
-                let mut keys_msg = format!("[HCW-3E] key not found! keys:");
-                for k in registry.keys() {
-                    keys_msg.push_str(&format!(" {:#x}", k));
-                }
-                keys_msg.push('\n');
-                hcw_log(keys_msg.as_bytes());
-                return;
-            }
+            None => return,
         };
-        hcw_log(b"[HCW-3] key found\n");
         (hook_data.ctx, hook_data.callback_bytes)
     }; // HOOK_REGISTRY lock released here
 
@@ -149,12 +115,6 @@ unsafe extern "C" fn hook_callback_wrapper(
     let callback: ffi::JSValue =
         std::ptr::read(callback_bytes.as_ptr() as *const ffi::JSValue);
 
-    // [DBG-4] About to call qjs_update_stack_top
-    {
-        let msg = format!("[HCW-4] ctx={:p} calling update_stack_top\n", ctx);
-        hcw_log(msg.as_bytes());
-    }
-
     // CRITICAL: Update QuickJS stack top before ANY QuickJS operations.
     // This hook callback fires in the hooked thread's context, which has a
     // different stack than the JS-init thread. Without this call, QuickJS's
@@ -162,10 +122,7 @@ unsafe extern "C" fn hook_callback_wrapper(
     // stack_top, sees a huge difference, falsely detects overflow, tries to
     // throw an exception, recurses, and crashes with SIGSEGV.
     ffi::qjs_update_stack_top(ctx);
-    hcw_log(b"[HCW-4] update_stack_top done\n");
 
-    // [DBG-5] About to create JS context object
-    hcw_log(b"[HCW-5] JS_NewObject\n");
     // Create context object for JS callback
     let js_ctx = ffi::JS_NewObject(ctx);
 
@@ -200,11 +157,8 @@ unsafe extern "C" fn hook_callback_wrapper(
         ffi::JS_FreeAtom(ctx, atom);
     }
 
-    // [DBG-6] Call JS callback
-    hcw_log(b"[HCW-6] JS_Call\n");
     let global = ffi::JS_GetGlobalObject(ctx);
     let result = ffi::JS_Call(ctx, callback, global, 1, &js_ctx as *const _ as *mut _);
-    hcw_log(b"[HCW-6] JS_Call done\n");
 
     // Check if callback modified any registers
     // Read back x0-x7 (commonly modified)
@@ -226,7 +180,6 @@ unsafe extern "C" fn hook_callback_wrapper(
     ffi::qjs_free_value(ctx, js_ctx);
     ffi::qjs_free_value(ctx, result);
     ffi::qjs_free_value(ctx, global);
-    hcw_log(b"[HCW-7] done\n");
 }
 
 /// hook(ptr, callback, stealth?) - Install a hook at the given address
@@ -384,7 +337,7 @@ unsafe extern "C" fn js_unhook(
 }
 
 /// callNative(ptr) - Call a native function at the given address with no arguments.
-/// Returns the i64 return value (X0 register) as a BigInt.
+/// Returns the i64 return value (X0 register) as a BigUint64.
 /// Useful for triggering hooked functions from JS to verify hook callbacks.
 unsafe extern "C" fn js_call_native(
     ctx: *mut ffi::JSContext,
@@ -414,8 +367,18 @@ unsafe extern "C" fn js_call_native(
         },
     };
 
-    if addr == 0 {
-        return ffi::JS_ThrowRangeError(ctx, b"callNative() null address\0".as_ptr() as *const _);
+    // Reject null and near-zero addresses without calling mincore:
+    // the first 64KB is never a valid user-space function pointer on ARM64 Android.
+    if addr < 0x10000 {
+        return ffi::JS_ThrowRangeError(ctx, b"callNative() address is not mapped\0".as_ptr() as *const _);
+    }
+
+    // For higher addresses, verify accessibility via mincore before calling.
+    if !is_addr_accessible(addr, 4) {
+        return ffi::JS_ThrowRangeError(
+            ctx,
+            b"callNative() address is not mapped\0".as_ptr() as *const _,
+        );
     }
 
     let func: unsafe extern "C" fn() -> i64 = std::mem::transmute(addr as usize);
@@ -438,7 +401,7 @@ pub fn register_hook_api(ctx: &JSContext) {
         let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_unhook), cname.as_ptr(), 1);
         global.set_property(ctx.as_ptr(), "unhook", JSValue(func_val));
 
-        // Register callNative(ptr) - call native function with no args, returns BigInt
+        // Register callNative(ptr) - call native function with no args, returns BigUint64
         let cname = CString::new("callNative").unwrap();
         let func_val =
             ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_call_native), cname.as_ptr(), 1);

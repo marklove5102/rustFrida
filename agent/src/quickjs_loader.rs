@@ -143,9 +143,19 @@ pub fn is_initialized() -> bool {
 /// Cleanup QuickJS resources
 pub fn cleanup() {
     ENGINE_INITIALIZED.store(false, Ordering::SeqCst);
-    cleanup_engine(); // 销毁 JSEngine (context + runtime)
-    cleanup_hooks(); // 清理所有 hooks
-    cleanup_hook_engine(); // 清理 hook 引擎内存
+    // Unhook all hooks first while the JS context (ctx) is still valid, so that
+    // qjs_free_value() in cleanup_hooks() can safely decrement callback refcounts.
+    // If cleanup_engine() ran first, JS_FreeContext would free the context, making
+    // the stored ctx pointers in HookData dangle → SIGSEGV in qjs_free_value.
+    cleanup_hooks();
+    // Destroy JSEngine (JS_FreeContext + JS_FreeRuntime). JSEngine::Drop also calls
+    // cleanup_hooks() as a safety net, which is a no-op here since the registry is
+    // already empty after the explicit call above.
+    cleanup_engine();
+    // Reset hook engine state (clears g_engine.hooks/free_list, destroys mutex).
+    // All hook entries were already removed by cleanup_hooks(), so no bytes are
+    // restored here; this only resets the pool cursor and the engine initialized flag.
+    cleanup_hook_engine();
 }
 
 #[cfg(test)]
