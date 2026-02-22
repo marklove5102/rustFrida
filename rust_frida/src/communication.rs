@@ -109,19 +109,18 @@ pub(crate) fn eval_state() -> &'static SyncChannel<std::result::Result<String, S
 
 pub(crate) static GLOBAL_SENDER: OnceLock<Sender<String>> = OnceLock::new();
 pub(crate) static AGENT_STAT: AtomicBool = AtomicBool::new(false);
+pub(crate) static AGENT_DISCONNECTED: AtomicBool = AtomicBool::new(false);
 
-/// 检查抽象 socket "rust_frida_socket" 是否已有监听者（表示另一个 rustfrida 实例正在运行）。
+/// 检查指定抽象 socket 是否已有监听者（表示另一个 rustfrida 实例正在运行）。
 /// 在 start_socket_listener 之前调用，连接成功则说明已有 agent 会话。
-/// 检查抽象 socket "rust_frida_socket" 是否已有监听者（表示另一个 rustfrida 实例正在运行）。
-/// 在 start_socket_listener 之前调用，连接成功则说明已有 agent 会话。
-pub(crate) fn check_agent_running() -> bool {
+pub(crate) fn check_agent_running(socket_name: &str) -> bool {
     use libc::{c_char, connect, socket, AF_UNIX, SOCK_STREAM};
     unsafe {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if fd < 0 {
             return false;
         }
-        let name = b"rust_frida_socket";
+        let name = socket_name.as_bytes();
         let mut addr: sockaddr_un = zeroed();
         addr.sun_family = AF_UNIX as u16;
         addr.sun_path[0] = 0; // abstract namespace
@@ -156,7 +155,11 @@ pub(crate) fn handle_socket_connection(stream: UnixStream) {
     loop {
         line.clear();
         match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF: connection closed
+            Ok(0) => {
+                // EOF: agent disconnected or shutdown
+                AGENT_DISCONNECTED.store(true, Ordering::Release);
+                break;
+            }
             Ok(_) => {}
             Err(e) => {
                 log_error!("读取连接失败: {}", e);
@@ -198,6 +201,7 @@ pub(crate) fn handle_socket_connection(stream: UnixStream) {
                         Ok(_) => {}
                         Err(e) => {
                             log_error!("stream 写入失败: {}", e);
+                            AGENT_DISCONNECTED.store(true, Ordering::Release);
                             break;
                         }
                     }

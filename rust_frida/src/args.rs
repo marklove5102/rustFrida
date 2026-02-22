@@ -13,24 +13,32 @@ fn parse_pid(s: &str) -> std::result::Result<i32, String> {
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Args {
-    /// 目标进程的PID（与 --watch-so 互斥）
+    /// 目标进程的PID（与 --watch-so、--name 互斥）
     #[arg(
         short,
         long,
-        required_unless_present = "watch_so",
-        conflicts_with = "watch_so",
+        required_unless_present_any = ["watch_so", "name"],
+        conflicts_with_all = ["watch_so", "name"],
         allow_hyphen_values = true,
         value_parser = parse_pid
     )]
     pub(crate) pid: Option<i32>,
 
     /// 监听指定 SO 路径加载，自动附加到加载该 SO 的进程
-    #[arg(short = 'w', long = "watch-so")]
+    #[arg(short = 'w', long = "watch-so", conflicts_with = "name")]
     pub(crate) watch_so: Option<String>,
+
+    /// 按进程名注入（与 --pid、--watch-so 互斥）
+    #[arg(short = 'n', long = "name")]
+    pub(crate) name: Option<String>,
 
     /// 监听超时时间（秒），默认无限等待
     #[arg(short = 't', long = "timeout")]
     pub(crate) timeout: Option<u64>,
+
+    /// 等待 agent 连接的超时时间（秒），默认 30 秒
+    #[arg(long = "connect-timeout", default_value = "30")]
+    pub(crate) connect_timeout: u64,
 
     /// 添加自定义字符串到字符串表（可多次使用）
     /// 格式: name=value 或直接指定值

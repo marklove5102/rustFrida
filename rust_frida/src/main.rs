@@ -11,7 +11,8 @@ mod types;
 use args::Args;
 use clap::Parser;
 use communication::{
-    check_agent_running, eval_state, start_socket_listener, AGENT_MEMFD, AGENT_STAT, GLOBAL_SENDER,
+    check_agent_running, eval_state, start_socket_listener, AGENT_DISCONNECTED, AGENT_MEMFD,
+    AGENT_STAT, GLOBAL_SENDER,
 };
 use injection::{create_memfd_with_data, inject_to_process, watch_and_inject, AGENT_SO};
 use libc::{close, sleep};
@@ -20,6 +21,65 @@ use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use std::sync::atomic::Ordering;
 use types::get_string_table_names;
+
+/// 通过读 /proc/*/cmdline 按进程名查找 PID。
+/// 精确匹配（含末路径组件）；多匹配列出并返回错误。
+fn find_pid_by_name(name: &str) -> Result<i32, String> {
+    use std::fs;
+
+    let mut matches: Vec<i32> = Vec::new();
+    let proc_dir = fs::read_dir("/proc").map_err(|e| format!("读取 /proc 失败: {}", e))?;
+
+    for entry in proc_dir.flatten() {
+        let fname = entry.file_name();
+        let fname_str = fname.to_string_lossy();
+        if !fname_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let pid: i32 = match fname_str.parse() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let cmdline_path = format!("/proc/{}/cmdline", pid);
+        if let Ok(data) = fs::read(&cmdline_path) {
+            let proc_name = data
+                .split(|&b| b == 0)
+                .next()
+                .and_then(|s| std::str::from_utf8(s).ok())
+                .unwrap_or("");
+            let base_name = proc_name.rsplit('/').next().unwrap_or(proc_name);
+            if proc_name == name || base_name == name {
+                matches.push(pid);
+            }
+        }
+    }
+
+    match matches.len() {
+        0 => Err(format!("未找到进程名匹配 '{}'", name)),
+        1 => Ok(matches[0]),
+        _ => {
+            log_warn!("找到多个匹配进程，请使用 --pid 指定:");
+            for pid in &matches {
+                let cmdline_path = format!("/proc/{}/cmdline", pid);
+                let display = if let Ok(data) = std::fs::read(&cmdline_path) {
+                    data.split(|&b| b == 0)
+                        .filter(|s| !s.is_empty())
+                        .take(2)
+                        .flat_map(|s| std::str::from_utf8(s))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                } else {
+                    "?".to_string()
+                };
+                println!("  PID {:6}: {}", pid, display);
+            }
+            Err(format!(
+                "找到 {} 个匹配进程，请使用 --pid <n> 精确指定",
+                matches.len()
+            ))
+        }
+    }
+}
 
 fn main() {
     // Fix #8: 先解析参数（--help/--version 在此退出），再打印 banner
@@ -41,17 +101,29 @@ fn main() {
         }
     }
 
-    // Fix #5: 注入前检测是否已有 agent 连接（另一个 rustfrida 实例正在运行）
-    if check_agent_running() {
-        log_warn!("警告: 检测到已有 agent 连接，目标进程可能已被注入！");
-        log_warn!("继续注入可能导致多个 agent 并存，建议先终止旧会话");
-    }
+    // 解析 --name 到 PID（如果指定）
+    let target_pid: Option<i32> = if let Some(ref name) = args.name {
+        match find_pid_by_name(name) {
+            Ok(pid) => {
+                log_success!("按名称 '{}' 找到进程 PID: {}", name, pid);
+                Some(pid)
+            }
+            Err(e) => {
+                log_error!("{}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        args.pid
+    };
 
-    // 启动抽象套接字监听（失败立即退出，不执行后续注入）
-    let handle = start_socket_listener("rust_frida_socket").unwrap_or_else(|e| {
-        log_error!("启动 socket 监听失败: {}", e);
-        std::process::exit(1);
-    });
+    // 计算动态 socket 名（按目标 PID 或宿主 PID 区分实例，避免多实例冲突）
+    let socket_name = if let Some(pid) = target_pid {
+        format!("rust_frida_{}", pid)
+    } else {
+        // --watch-so: 目标 PID 注入时才知道，用宿主 PID 保证唯一性
+        format!("rust_frida_h{}", std::process::id())
+    };
 
     // 解析字符串覆盖参数（格式：name=value）
     let mut string_overrides = std::collections::HashMap::new();
@@ -81,16 +153,32 @@ fn main() {
         }
     }
 
+    // 自动写入动态 socket_name（用户未通过 --string 覆盖时）
+    if !string_overrides.contains_key("socket_name") {
+        string_overrides.insert("socket_name".to_string(), socket_name.clone());
+    }
+
+    // Fix #5: 注入前检测是否已有 agent 连接（另一个 rustfrida 实例正在运行）
+    if check_agent_running(&socket_name) {
+        log_warn!("警告: 检测到已有 agent 连接，目标进程可能已被注入！");
+        log_warn!("继续注入可能导致多个 agent 并存，建议先终止旧会话");
+    }
+
+    // 启动抽象套接字监听（失败立即退出，不执行后续注入）
+    let handle = start_socket_listener(&socket_name).unwrap_or_else(|e| {
+        log_error!("启动 socket 监听失败: {}", e);
+        std::process::exit(1);
+    });
+
     // 根据参数选择注入方式
-    // Fix #9: pid 已由 args.rs value_parser 验证为正整数，无需重复检查
     let result = if let Some(so_pattern) = &args.watch_so {
         // 使用 eBPF 监听 SO 加载
         watch_and_inject(so_pattern, args.timeout, &string_overrides)
-    } else if let Some(pid) = args.pid {
-        // 直接附加到指定 PID
+    } else if let Some(pid) = target_pid {
+        // 直接附加到指定 PID（来自 --pid 或 --name 解析结果）
         inject_to_process(pid, &string_overrides)
     } else {
-        log_error!("必须指定 --pid 或 --watch-so");
+        log_error!("必须指定 --pid、--name 或 --watch-so");
         std::process::exit(1);
     };
 
@@ -99,9 +187,23 @@ fn main() {
         std::process::exit(1);
     }
 
-    while !AGENT_STAT.load(Ordering::Acquire) {
-        unsafe { sleep(1) };
-        log_info!("等待 agent 连接...");
+    // 等待 agent 连接，默认超时 30s（可通过 --connect-timeout 调整）
+    {
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(args.connect_timeout);
+        while !AGENT_STAT.load(Ordering::Acquire) {
+            if std::time::Instant::now() >= deadline {
+                log_error!(
+                    "等待 agent 连接超时 ({}s)，请检查:",
+                    args.connect_timeout
+                );
+                log_error!("  1. dmesg | grep -i deny  （SELinux 拦截？）");
+                log_error!("  2. logcat | grep -E 'FATAL|crash'  （agent 崩溃？）");
+                std::process::exit(1);
+            }
+            unsafe { sleep(1) };
+            log_info!("等待 agent 连接...");
+        }
     }
     let sender = GLOBAL_SENDER.get().unwrap();
 
@@ -173,6 +275,12 @@ fn main() {
     };
 
     loop {
+        // 检测 agent 是否已断连（agent 崩溃或目标进程被杀）
+        if AGENT_DISCONNECTED.load(Ordering::Acquire) {
+            println!("\x1b[31m[!] Agent 连接已断开，请重新注入\x1b[0m");
+            break;
+        }
+
         match rl.readline("rustfrida> ") {
             Ok(line) => {
                 let line = line.trim().to_string();
