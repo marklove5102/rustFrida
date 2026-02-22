@@ -42,6 +42,19 @@ static HookEngine g_engine = {0};
 
 /* --- Pool permission management (Fix 2: RWX → R-X) --- */
 
+/*
+ * Restore a target code page to R-X after patching.
+ * Try 0x2000 (two pages) first in case the hook spans a page boundary.
+ * Fall back to two separate 0x1000 calls when the range crosses a VMA
+ * boundary (mprotect returns EINVAL for the 2-page span but succeeds per page).
+ */
+static void restore_page_rx(uintptr_t page_start) {
+    if (mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC) != 0) {
+        mprotect((void*)page_start, 0x1000, PROT_READ | PROT_EXEC);
+        mprotect((void*)(page_start + 0x1000), 0x1000, PROT_READ | PROT_EXEC);
+    }
+}
+
 static int pool_make_writable(void) {
     if (!g_engine.exec_mem) return -1;
     return mprotect(g_engine.exec_mem, g_engine.exec_mem_size,
@@ -385,7 +398,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
         jump_result = hook_write_jump(target, replacement);
         if (jump_result < 0) {
-            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
+            restore_page_rx(page_start);
             free_entry(entry);
             pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
@@ -393,7 +406,7 @@ void* hook_install(void* target, void* replacement, int stealth) {
         }
         entry->stealth = 0;
         /* Restore target page from RWX to R-X now that the jump is written */
-        mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
+        restore_page_rx(page_start);
     }
 
     /* Flush cache */
@@ -650,7 +663,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         }
         jump_result = hook_write_jump(target, thunk_mem);
         if (jump_result < 0) {
-            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
+            restore_page_rx(page_start);
             free_entry(entry);
             pool_make_executable();
             pthread_mutex_unlock(&g_engine.lock);
@@ -658,7 +671,7 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
         }
         entry->stealth = 0;
         /* Restore target page from RWX to R-X now that the jump is written */
-        mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
+        restore_page_rx(page_start);
     }
 
     /* Flush caches */
@@ -710,7 +723,7 @@ int hook_remove(void* target) {
                 }
                 memcpy(target, entry->original_bytes, entry->original_size);
                 /* Restore target page from RWX to R-X after writing original bytes back */
-                mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
+                restore_page_rx(page_start);
             }
             hook_flush_cache(target, entry->original_size);
 
@@ -772,7 +785,7 @@ void hook_engine_cleanup(void) {
             mprotect((void*)page_start, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC);
             memcpy(entry->target, entry->original_bytes, entry->original_size);
             /* Restore target page to R-X after writing original bytes back */
-            mprotect((void*)page_start, 0x2000, PROT_READ | PROT_EXEC);
+            restore_page_rx(page_start);
         }
         hook_flush_cache(entry->target, entry->original_size);
         entry = entry->next;

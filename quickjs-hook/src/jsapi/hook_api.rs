@@ -166,9 +166,17 @@ unsafe extern "C" fn hook_callback_wrapper(
     if ffi::qjs_is_exception(result) != 0 {
         let exc = ffi::JS_GetException(ctx);
         let exc_val = JSValue(exc);
-        if let Some(msg) = exc_val.to_string(ctx) {
-            output_message(&format!("[hook error] {}", msg));
-        }
+        // Use .message property directly (avoids calling toString() which may itself throw
+        // and return NULL from JS_ToCString, silencing the error message entirely).
+        let msg_prop = exc_val.get_property(ctx, "message");
+        let msg = if let Some(s) = msg_prop.to_string(ctx) {
+            msg_prop.free(ctx);
+            s
+        } else {
+            msg_prop.free(ctx);
+            exc_val.to_string(ctx).unwrap_or_else(|| "[unknown exception]".to_string())
+        };
+        output_message(&format!("[hook error] {}", msg));
         exc_val.free(ctx);
         // JS_EXCEPTION sentinel does not own heap memory; qjs_free_value is a no-op for it.
         ffi::qjs_free_value(ctx, js_ctx);
@@ -418,13 +426,14 @@ unsafe extern "C" fn js_call_native(
         std::mem::transmute(addr as usize);
     let result = func(args[0], args[1], args[2], args[3], args[4], args[5]);
 
-    // Return Number when result fits exactly as f64 (≤ 2^53), BigUint64 for larger values.
-    // This allows JS equality comparisons (==) to work for most practical addresses/values.
-    let result_u64 = result as u64;
-    if result_u64 <= (1u64 << 53) {
-        ffi::qjs_new_float64(ctx, result_u64 as f64)
+    // Return Number when the result magnitude fits exactly as f64 (≤ 2^53).
+    // Use unsigned_abs() so negative i64 results (e.g. errno -1) are also returned
+    // as JS Number instead of wrapping to a huge BigUint64.
+    // JS_NewInt64 encodes small integers as JS_TAG_INT (typeof === "number").
+    if result.unsigned_abs() <= (1u64 << 53) {
+        ffi::qjs_new_int64(ctx, result)
     } else {
-        ffi::JS_NewBigUint64(ctx, result_u64)
+        ffi::JS_NewBigUint64(ctx, result as u64)
     }
 }
 
