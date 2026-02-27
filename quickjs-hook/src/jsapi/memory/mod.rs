@@ -17,10 +17,10 @@ pub fn register_memory_api(ctx: &JSContext) {
     let memory = ctx.new_object();
 
     macro_rules! add_method {
-        ($name:expr, $func:expr) => {
+        ($name:expr, $func:expr, $argc:expr) => {
             unsafe {
                 let cname = CString::new($name).unwrap();
-                let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), 0);
+                let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), $argc);
                 let prop_name = CString::new($name).unwrap();
                 let atom = ffi::JS_NewAtom(ctx.as_ptr(), prop_name.as_ptr());
                 ffi::qjs_set_property(ctx.as_ptr(), memory.raw(), atom, func_val);
@@ -29,19 +29,19 @@ pub fn register_memory_api(ctx: &JSContext) {
         };
     }
 
-    add_method!("readU8", memory_read_u8);
-    add_method!("readU16", memory_read_u16);
-    add_method!("readU32", memory_read_u32);
-    add_method!("readU64", memory_read_u64);
-    add_method!("readPointer", memory_read_pointer);
-    add_method!("readCString", memory_read_cstring);
-    add_method!("readUtf8String", memory_read_utf8_string);
-    add_method!("readByteArray", memory_read_byte_array);
-    add_method!("writeU8", memory_write_u8);
-    add_method!("writeU16", memory_write_u16);
-    add_method!("writeU32", memory_write_u32);
-    add_method!("writeU64", memory_write_u64);
-    add_method!("writePointer", memory_write_pointer);
+    add_method!("readU8", memory_read_u8, 1);
+    add_method!("readU16", memory_read_u16, 1);
+    add_method!("readU32", memory_read_u32, 1);
+    add_method!("readU64", memory_read_u64, 1);
+    add_method!("readPointer", memory_read_pointer, 1);
+    add_method!("readCString", memory_read_cstring, 1);
+    add_method!("readUtf8String", memory_read_utf8_string, 1);
+    add_method!("readByteArray", memory_read_byte_array, 2);
+    add_method!("writeU8", memory_write_u8, 2);
+    add_method!("writeU16", memory_write_u16, 2);
+    add_method!("writeU32", memory_write_u32, 2);
+    add_method!("writeU64", memory_write_u64, 2);
+    add_method!("writePointer", memory_write_pointer, 2);
 
     // Set Memory on global object
     global.set_property(ctx.as_ptr(), "Memory", memory);

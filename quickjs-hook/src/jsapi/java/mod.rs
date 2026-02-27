@@ -108,17 +108,20 @@ pub fn cleanup_java_hooks() {
                 // Remove native trampoline from hook engine
                 hook_ffi::hook_remove_redirect(data.art_method);
 
-                // Restore original ArtMethod state
+                // Restore original ArtMethod state (access_flags_ + entry_point_ only; data_ was not modified)
                 if let Some(&ep_offset) = ENTRY_POINT_OFFSET.get() {
                     let flags_ptr = (data.art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET)
                         as *mut u32;
                     std::ptr::write_volatile(flags_ptr, data.original_access_flags);
 
-                    let data_ptr = (data.art_method as usize + data_offset_for(ep_offset)) as *mut u64;
-                    std::ptr::write_volatile(data_ptr, data.original_data);
-
                     let ep_ptr = (data.art_method as usize + ep_offset) as *mut u64;
                     std::ptr::write_volatile(ep_ptr, data.original_entry_point);
+
+                    // 刷新指令缓存，确保 ArtMethod 恢复立即生效
+                    hook_ffi::hook_flush_cache(
+                        (data.art_method as usize) as *mut std::ffi::c_void,
+                        ep_offset + 8,
+                    );
                 }
 
                 // Free ArtMethod clone

@@ -245,11 +245,19 @@ unsafe extern "C" fn js_call_original(
         );
     }
 
-    // Build jvalue args from HookContext registers x2-x7
+    // Build jvalue args from HookContext registers x2-x7 + stack spill
     // jvalue is a union of 8 bytes (same size on ARM64)
-    let mut jargs: [u64; 6] = [0; 6];
-    for i in 0..std::cmp::min(param_count, 6) {
-        jargs[i] = hook_ctx.x[2 + i];
+    // ARM64 JNI: x0=JNIEnv, x1=this/class, x2-x7=args 0-5, stack for args 6+
+    let mut jargs: Vec<u64> = Vec::with_capacity(param_count);
+    for i in 0..param_count {
+        let val = if i < 6 {
+            hook_ctx.x[2 + i]
+        } else {
+            // Args 6+ are on the stack at SP+0, SP+8, SP+16, ...
+            let sp = hook_ctx.sp as usize;
+            *((sp + (i - 6) * 8) as *const u64)
+        };
+        jargs.push(val);
     }
     let jargs_ptr = if param_count > 0 {
         jargs.as_ptr() as *const std::ffi::c_void
@@ -296,6 +304,18 @@ unsafe extern "C" fn js_call_original(
                                           cls, this_obj, clone_mid, jargs_ptr, is_static, i64);
             jni_check_exc(env);
             ffi::JS_NewBigUint64(ctx, ret as u64)
+        }
+        b'F' => {
+            let ret: f32 = dispatch_call!(env, JNI_CALL_STATIC_FLOAT_METHOD_A, JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A,
+                                          cls, this_obj, clone_mid, jargs_ptr, is_static, f32);
+            jni_check_exc(env);
+            JSValue::float(ret as f64).raw()
+        }
+        b'D' => {
+            let ret: f64 = dispatch_call!(env, JNI_CALL_STATIC_DOUBLE_METHOD_A, JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A,
+                                          cls, this_obj, clone_mid, jargs_ptr, is_static, f64);
+            jni_check_exc(env);
+            JSValue::float(ret).raw()
         }
         b'L' | b'[' => {
             let ret: *mut std::ffi::c_void = dispatch_call!(env, JNI_CALL_STATIC_OBJECT_METHOD_A, JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A,
@@ -345,12 +365,16 @@ unsafe fn marshal_jni_arg_to_js(
         b'I' => JSValue::int(raw as i32).raw(),
         b'J' => ffi::JS_NewBigUint64(ctx, raw),
         b'F' => {
-            // Float is passed as 32-bit IEEE 754 in the low 32 bits of the register
+            // KNOWN LIMITATION: ARM64 ABI passes floats in d0-d7 (FP registers), not x registers.
+            // HookContext currently only saves x0-x30. The `raw` value comes from an x register,
+            // which may not contain the float argument. This will produce incorrect values.
+            // TODO: Extend HookContext to save d0-d7 and read float args from FP registers.
             let f = f32::from_bits(raw as u32);
             JSValue::float(f as f64).raw()
         }
         b'D' => {
-            // Double is passed as 64-bit IEEE 754 in the register
+            // KNOWN LIMITATION: Same as F — double args are in d registers, not x registers.
+            // TODO: Extend HookContext to save d0-d7 and read double args from FP registers.
             let d = f64::from_bits(raw);
             JSValue::float(d).raw()
         }
@@ -472,15 +496,19 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         JSValue(js_ctx).set_property(ctx, "thisObj", JSValue(val));
     }
 
-    // Add args[] — x2-x7 contain Java arguments, marshalled to JS values by JNI type.
+    // Add args[] — x2-x7 contain first 6 Java arguments, stack for args 6+.
     // JNIEnv* from x0 for reading String/Object args.
     {
         let env: JniEnv = hook_ctx.x[0] as JniEnv;
         let arr = ffi::JS_NewArray(ctx);
         for i in 0..param_count {
-            let reg_idx = 2 + i; // JNI: args always start at x2
-            if reg_idx >= 8 { break; } // x2-x7 = first 6 args
-            let raw = hook_ctx.x[reg_idx];
+            let raw = if i < 6 {
+                hook_ctx.x[2 + i] // x2-x7
+            } else {
+                // Args 6+ are on the stack at SP+0, SP+8, SP+16, ...
+                let sp = hook_ctx.sp as usize;
+                *((sp + (i - 6) * 8) as *const u64)
+            };
             let val = marshal_jni_arg_to_js(ctx, env, raw, param_types.get(i).map(|s| s.as_str()));
             ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
         }
@@ -521,13 +549,34 @@ pub(super) unsafe extern "C" fn java_hook_callback(
         // Propagate JS return value to HookContext.x[0] for non-void methods.
         // The thunk restores x0 from HookContext, so ART sees this as the return value.
         let result_val = JSValue(result);
-        let ret_u64 = if let Some(v) = result_val.to_u64(ctx) {
-            v
-        } else if let Some(v) = result_val.to_i64(ctx) {
-            v as u64
-        } else {
-            // undefined/null → 0 (NULL for objects, 0 for primitives)
-            0u64
+        let ret_u64 = match return_type {
+            b'F' => {
+                // Float: convert JS number to f32 IEEE 754 bits in low 32 bits
+                if let Some(f) = result_val.to_float() {
+                    (f as f32).to_bits() as u64
+                } else {
+                    0u64
+                }
+            }
+            b'D' => {
+                // Double: convert JS number to f64 IEEE 754 bits
+                if let Some(f) = result_val.to_float() {
+                    f.to_bits()
+                } else {
+                    0u64
+                }
+            }
+            _ => {
+                // Integer/object types: use u64/i64 conversion
+                if let Some(v) = result_val.to_u64(ctx) {
+                    v
+                } else if let Some(v) = result_val.to_i64(ctx) {
+                    v as u64
+                } else {
+                    // undefined/null → 0 (NULL for objects, 0 for primitives)
+                    0u64
+                }
+            }
         };
         (*ctx_ptr).x[0] = ret_u64;
     }

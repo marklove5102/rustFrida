@@ -52,6 +52,10 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         Err(std::sync::TryLockError::WouldBlock) => {
             // Same thread already holds JS_ENGINE (re-entrant call) or another
             // thread is mid-callback. Skip this invocation to avoid deadlock.
+            output_message(&format!(
+                "[hook] callback skipped (JS engine busy), target={:#x}",
+                target_addr
+            ));
             return;
         }
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -131,9 +135,8 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
         return;
     }
 
-    // Check if callback modified any registers
-    // Read back x0-x7 (commonly modified)
-    for i in 0..8 {
+    // Read back x0-x30 from JS context to HookContext (allows JS to modify any register)
+    for i in 0..31 {
         let prop_name = format!("x{}", i);
         let cprop = CString::new(prop_name).unwrap();
         let atom = ffi::JS_NewAtom(ctx, cprop.as_ptr());

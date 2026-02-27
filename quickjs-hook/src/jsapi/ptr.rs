@@ -148,6 +148,56 @@ unsafe extern "C" fn js_ptr(
     create_native_pointer(ctx, addr).raw()
 }
 
+/// Parse an offset argument for add()/sub() with strict type checking.
+/// Accepts: int, float, BigInt, hex string ("0x..."), or NativePointer.
+/// Rejects: plain strings, objects, booleans, null, undefined → TypeError.
+unsafe fn parse_offset(ctx: *mut ffi::JSContext, arg: JSValue) -> Result<i64, ffi::JSValue> {
+    if arg.is_int() || arg.is_float() || ffi::qjs_is_big_int(ctx, arg.raw()) != 0 {
+        // Number or BigInt — safe to use to_i64
+        match arg.to_i64(ctx) {
+            Some(v) => Ok(v),
+            None => Err(ffi::JS_ThrowTypeError(
+                ctx,
+                b"failed to convert numeric offset\0".as_ptr() as *const _,
+            )),
+        }
+    } else if arg.is_string() {
+        // Only accept hex strings with 0x/0X prefix
+        let s = match arg.to_string(ctx) {
+            Some(s) => s,
+            None => {
+                return Err(ffi::JS_ThrowTypeError(
+                    ctx,
+                    b"invalid string argument\0".as_ptr() as *const _,
+                ));
+            }
+        };
+        let trimmed = s.trim();
+        if !trimmed.starts_with("0x") && !trimmed.starts_with("0X") {
+            return Err(ffi::JS_ThrowTypeError(
+                ctx,
+                b"string offset must be hex (0x...)\0".as_ptr() as *const _,
+            ));
+        }
+        let hex = &trimmed[2..];
+        match u64::from_str_radix(hex, 16) {
+            Ok(v) => Ok(v as i64),
+            Err(_) => Err(ffi::JS_ThrowTypeError(
+                ctx,
+                b"invalid hex string\0".as_ptr() as *const _,
+            )),
+        }
+    } else if let Some(ptr_addr) = get_native_pointer_addr(ctx, arg) {
+        // NativePointer — use its address as offset
+        Ok(ptr_addr as i64)
+    } else {
+        Err(ffi::JS_ThrowTypeError(
+            ctx,
+            b"offset must be a number, hex string, or NativePointer\0".as_ptr() as *const _,
+        ))
+    }
+}
+
 /// NativePointer.add() implementation
 unsafe extern "C" fn native_pointer_add(
     ctx: *mut ffi::JSContext,
@@ -165,7 +215,10 @@ unsafe extern "C" fn native_pointer_add(
         return ffi::JS_ThrowTypeError(ctx, b"add() requires 1 argument\0".as_ptr() as *const _);
     }
 
-    let offset = JSValue(*argv).to_i64(ctx).unwrap_or(0) as i64;
+    let offset = match parse_offset(ctx, JSValue(*argv)) {
+        Ok(v) => v,
+        Err(exc) => return exc,
+    };
     let new_addr = (addr as i64 + offset) as u64;
 
     create_native_pointer(ctx, new_addr).raw()
@@ -188,7 +241,10 @@ unsafe extern "C" fn native_pointer_sub(
         return ffi::JS_ThrowTypeError(ctx, b"sub() requires 1 argument\0".as_ptr() as *const _);
     }
 
-    let offset = JSValue(*argv).to_i64(ctx).unwrap_or(0) as i64;
+    let offset = match parse_offset(ctx, JSValue(*argv)) {
+        Ok(v) => v,
+        Err(exc) => return exc,
+    };
     let new_addr = (addr as i64 - offset) as u64;
 
     create_native_pointer(ctx, new_addr).raw()

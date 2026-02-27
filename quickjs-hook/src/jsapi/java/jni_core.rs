@@ -122,6 +122,38 @@ pub(super) type GetObjectFieldFn = unsafe extern "C" fn(
     JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
 ) -> *mut std::ffi::c_void;
 
+// Static field getter types (signature: env, cls, fid → value)
+pub(super) type GetStaticFieldIdFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *const c_char, *const c_char,
+) -> *mut std::ffi::c_void;
+pub(super) type GetStaticBooleanFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> u8;
+pub(super) type GetStaticByteFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> i8;
+pub(super) type GetStaticCharFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> u16;
+pub(super) type GetStaticShortFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> i16;
+pub(super) type GetStaticIntFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> i32;
+pub(super) type GetStaticLongFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> i64;
+pub(super) type GetStaticFloatFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> f32;
+pub(super) type GetStaticDoubleFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> f64;
+pub(super) type GetStaticObjectFieldFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void,
+) -> *mut std::ffi::c_void;
+
 /// Call a JNI function from the function table by index.
 /// JNIEnv is `JNINativeInterface**` — (*env)[index] is the function pointer.
 #[inline]
@@ -144,22 +176,19 @@ pub(super) unsafe fn jni_check_exc(env: JniEnv) -> bool {
 }
 
 /// Check if a 64-bit value looks like a valid ARM64 code pointer.
-/// Valid user-space code pointers on ARM64 Android have:
-/// - Bits 48-63 all zero (canonical lower-half address)
-/// - Non-zero value (not null)
-/// - dladdr resolves it (it's in a mapped executable region)
+/// Strips PAC/TBI high bits (bits 48-63) before checking, since entry_point
+/// values may carry PAC signatures or MTE tags on supported devices.
+/// After stripping, verifies via dladdr that the address is in a mapped executable region.
 pub(super) fn is_code_pointer(val: u64) -> bool {
-    if val == 0 {
-        return false;
-    }
-    // Check canonical form: bits 48-63 must be 0 for user-space
-    if (val >> 48) != 0 {
+    // Strip PAC/TBI bits to get the bare virtual address (48-bit canonical form)
+    let stripped = val & 0x0000_FFFF_FFFF_FFFF;
+    if stripped == 0 {
         return false;
     }
     // Verify it resolves via dladdr (mapped executable memory)
     unsafe {
         let mut info: libc::Dl_info = std::mem::zeroed();
-        libc::dladdr(val as *const std::ffi::c_void, &mut info) != 0
+        libc::dladdr(stripped as *const std::ffi::c_void, &mut info) != 0
     }
 }
 
@@ -296,6 +325,8 @@ pub(super) const JNI_CALL_NONVIRTUAL_OBJECT_METHOD_A: usize = 66;
 pub(super) const JNI_CALL_NONVIRTUAL_BOOLEAN_METHOD_A: usize = 69;
 pub(super) const JNI_CALL_NONVIRTUAL_INT_METHOD_A: usize = 81;
 pub(super) const JNI_CALL_NONVIRTUAL_LONG_METHOD_A: usize = 84;
+pub(super) const JNI_CALL_NONVIRTUAL_FLOAT_METHOD_A: usize = 87;
+pub(super) const JNI_CALL_NONVIRTUAL_DOUBLE_METHOD_A: usize = 90;
 pub(super) const JNI_CALL_NONVIRTUAL_VOID_METHOD_A: usize = 93;
 
 // CallStatic*MethodA indices (for callOriginal on static methods)
@@ -303,6 +334,8 @@ pub(super) const JNI_CALL_STATIC_VOID_METHOD_A: usize = 143;
 pub(super) const JNI_CALL_STATIC_BOOLEAN_METHOD_A: usize = 119;
 pub(super) const JNI_CALL_STATIC_INT_METHOD_A: usize = 131;
 pub(super) const JNI_CALL_STATIC_LONG_METHOD_A: usize = 134;
+pub(super) const JNI_CALL_STATIC_FLOAT_METHOD_A: usize = 137;
+pub(super) const JNI_CALL_STATIC_DOUBLE_METHOD_A: usize = 140;
 
 // Ref management
 pub(super) const JNI_DELETE_GLOBAL_REF: usize = 22;
@@ -322,12 +355,23 @@ pub(super) const JNI_GET_LONG_FIELD: usize = 101;
 pub(super) const JNI_GET_FLOAT_FIELD: usize = 102;
 pub(super) const JNI_GET_DOUBLE_FIELD: usize = 103;
 
+// Static field access
+pub(super) const JNI_GET_STATIC_FIELD_ID: usize = 144;
+pub(super) const JNI_GET_STATIC_OBJECT_FIELD: usize = 145;
+pub(super) const JNI_GET_STATIC_BOOLEAN_FIELD: usize = 146;
+pub(super) const JNI_GET_STATIC_BYTE_FIELD: usize = 147;
+pub(super) const JNI_GET_STATIC_CHAR_FIELD: usize = 148;
+pub(super) const JNI_GET_STATIC_SHORT_FIELD: usize = 149;
+pub(super) const JNI_GET_STATIC_INT_FIELD: usize = 150;
+pub(super) const JNI_GET_STATIC_LONG_FIELD: usize = 151;
+pub(super) const JNI_GET_STATIC_FLOAT_FIELD: usize = 152;
+pub(super) const JNI_GET_STATIC_DOUBLE_FIELD: usize = 153;
+
 // ============================================================================
 // JNI state (lazy-initialized, cached)
 // ============================================================================
 
 pub(super) struct JniState {
-    pub(super) env: JniEnv,               // JNIEnv*
     pub(super) vm: *mut std::ffi::c_void, // JavaVM*
 }
 
@@ -336,13 +380,21 @@ unsafe impl Sync for JniState {}
 
 pub(super) static JNI_STATE: Mutex<Option<JniState>> = Mutex::new(None);
 
-/// Initialize JNI state by finding the existing JavaVM in the target process.
+/// Initialize JNI state by finding the existing JavaVM in the target process,
+/// then return a JNIEnv* for the **current thread** via AttachCurrentThread.
+///
+/// JNIEnv is thread-local — each thread must use its own env pointer.
+/// AttachCurrentThread is idempotent (cheap if already attached).
 pub(super) fn ensure_jni_initialized() -> Result<JniEnv, String> {
-    let mut guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(ref state) = *guard {
-        return Ok(state.env);
+    // Fast path: VM already found, just attach current thread
+    {
+        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref state) = *guard {
+            return unsafe { attach_current_thread(state.vm) };
+        }
     }
 
+    // Slow path: find JavaVM first
     unsafe {
         // Find JNI_GetCreatedJavaVMs — try RTLD_DEFAULT first, then explicit dlopen
         let sym_name = CString::new("JNI_GetCreatedJavaVMs").unwrap();
@@ -376,40 +428,20 @@ pub(super) fn ensure_jni_initialized() -> Result<JniEnv, String> {
             return Err("JNI_GetCreatedJavaVMs failed".to_string());
         }
 
-        // JavaVM is JNIInvokeInterface** — (*vm)[index] is the function pointer
-        // AttachCurrentThread is at index 4 (GetEnv=6, but AttachCurrentThread=4)
-        let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
-        let attach_fn: unsafe extern "C" fn(
-            *mut std::ffi::c_void, // JavaVM*
-            *mut *mut std::ffi::c_void, // JNIEnv**
-            *mut std::ffi::c_void, // args (NULL)
-        ) -> i32 = std::mem::transmute(*vm_table.add(4));
-
-        let mut env_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-        let ret = attach_fn(vm_ptr, &mut env_ptr, std::ptr::null_mut());
-        if ret != 0 || env_ptr.is_null() {
-            return Err("AttachCurrentThread failed".to_string());
+        // Cache VM pointer
+        {
+            let mut guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
+            *guard = Some(JniState { vm: vm_ptr });
         }
 
-        let env: JniEnv = env_ptr as JniEnv;
-        *guard = Some(JniState { env, vm: vm_ptr });
-        Ok(env)
+        // Attach current thread and return its env
+        attach_current_thread(vm_ptr)
     }
 }
 
-/// Get a valid JNIEnv* for the current thread via AttachCurrentThread.
-/// Safe to call from any thread (hook callbacks run on the hooked thread).
-/// AttachCurrentThread is idempotent — returns existing env if already attached.
-pub(super) unsafe fn get_thread_env() -> Result<JniEnv, String> {
-    let _ = ensure_jni_initialized()?;
-    let vm_ptr = {
-        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(state) => state.vm,
-            None => return Err("JNI not initialized".to_string()),
-        }
-    };
-
+/// Attach the current thread to the JavaVM and return its JNIEnv*.
+/// Idempotent — returns existing env if thread is already attached.
+unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv, String> {
     let vm_table = *(vm_ptr as *const *const *const std::ffi::c_void);
     let attach_fn: unsafe extern "C" fn(
         *mut std::ffi::c_void,
@@ -424,4 +456,12 @@ pub(super) unsafe fn get_thread_env() -> Result<JniEnv, String> {
     }
 
     Ok(env_ptr as JniEnv)
+}
+
+/// Get a valid JNIEnv* for the current thread via AttachCurrentThread.
+/// Safe to call from any thread (hook callbacks run on the hooked thread).
+/// AttachCurrentThread is idempotent — returns existing env if already attached.
+pub(super) unsafe fn get_thread_env() -> Result<JniEnv, String> {
+    // ensure_jni_initialized now always returns current thread's env
+    ensure_jni_initialized()
 }

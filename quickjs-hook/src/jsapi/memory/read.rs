@@ -25,7 +25,7 @@ pub(super) unsafe extern "C" fn memory_read_u8(
     if !is_addr_accessible(addr, 1) {
         return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
     }
-    let val = *(addr as *const u8);
+    let val = std::ptr::read(addr as *const u8);
     JSValue::int(val as i32).raw()
 }
 
@@ -157,12 +157,20 @@ pub(super) unsafe extern "C" fn memory_read_cstring(
         return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
     }
     // Bounded scan: find '\0' within MAX_CSTRING_LEN bytes to avoid SEGV on unterminated buffers.
+    // Only call is_addr_accessible at page boundaries (every 4096 bytes) for performance.
     const MAX_CSTRING_LEN: usize = 4096;
+    const PAGE_SIZE: u64 = 4096;
     let mut len = 0usize;
+    // Track next page boundary that needs checking
+    let mut next_page_check = (addr + PAGE_SIZE) & !(PAGE_SIZE - 1);
     while len < MAX_CSTRING_LEN {
         let byte_addr = addr + len as u64;
-        if !is_addr_accessible(byte_addr, 1) {
-            break;
+        // Check accessibility when we cross into a new page
+        if byte_addr >= next_page_check {
+            if !is_addr_accessible(byte_addr, 1) {
+                break;
+            }
+            next_page_check = (byte_addr + PAGE_SIZE) & !(PAGE_SIZE - 1);
         }
         if *(byte_addr as *const u8) == 0 {
             break;
@@ -210,9 +218,20 @@ pub(super) unsafe extern "C" fn memory_read_byte_array(
         None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
     };
 
-    let length = JSValue(*argv.add(1)).to_i64(ctx).unwrap_or(0) as usize;
+    let length_raw = match JSValue(*argv.add(1)).to_i64(ctx) {
+        Some(v) => v,
+        None => return ffi::JS_ThrowTypeError(ctx, b"readByteArray: length must be a number\0".as_ptr() as *const _),
+    };
+    if length_raw <= 0 {
+        return ffi::JS_ThrowRangeError(ctx, b"readByteArray: length must be positive\0".as_ptr() as *const _);
+    }
+    const MAX_READ_SIZE: i64 = 1024 * 1024 * 1024; // 1GB
+    if length_raw > MAX_READ_SIZE {
+        return ffi::JS_ThrowRangeError(ctx, b"readByteArray: length exceeds maximum (1GB)\0".as_ptr() as *const _);
+    }
+    let length = length_raw as usize;
 
-    if !is_addr_accessible(addr, length.max(1)) {
+    if !is_addr_accessible(addr, length) {
         return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
     }
     // Create ArrayBuffer

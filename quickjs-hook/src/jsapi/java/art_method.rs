@@ -114,6 +114,26 @@ pub(super) unsafe fn set_native_hook_flags(art_method: u64) {
     std::ptr::write_volatile(ptr, new_flags);
 }
 
+/// Modify ArtMethod access_flags_ for entry_point hooking (GC-safe).
+///
+/// Unlike set_native_hook_flags(), this does NOT set kAccNative.
+/// We write our thunk directly to entry_point_ and let ART jump there as
+/// "compiled code". This avoids modifying data_ (which GC scans as a heap ref).
+///
+/// Sets kAccCompileDontBother to prevent JIT from recompiling and overwriting entry_point_.
+/// Clears fast-path flags that could bypass entry_point_ dispatch.
+pub(super) unsafe fn set_hook_flags(art_method: u64) {
+    let ptr = (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32;
+    let flags = std::ptr::read_volatile(ptr);
+    let new_flags = (flags | K_ACC_COMPILE_DONT_BOTHER)
+        & !(K_ACC_CRITICAL_NATIVE
+            | K_ACC_FAST_NATIVE
+            | K_ACC_NTERP_ENTRY_POINT_FAST_PATH
+            | K_ACC_FAST_INTERP_TO_INTERP
+            | K_ACC_SINGLE_IMPLEMENTATION);
+    std::ptr::write_volatile(ptr, new_flags);
+}
+
 /// Cached generic JNI trampoline address (art_quick_generic_jni_trampoline).
 static JNI_TRAMPOLINE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -337,6 +357,7 @@ pub(super) unsafe fn find_jni_trampoline(_env: JniEnv, _ep_offset: usize) -> u64
 pub(super) struct CachedFieldInfo {
     pub(super) jni_sig: String,
     pub(super) field_id: *mut std::ffi::c_void, // jfieldID — stable across threads
+    pub(super) is_static: bool,
 }
 
 unsafe impl Send for CachedFieldInfo {}
@@ -346,7 +367,7 @@ unsafe impl Sync for CachedFieldInfo {}
 pub(super) static FIELD_CACHE: Mutex<Option<HashMap<String, HashMap<String, CachedFieldInfo>>>> =
     Mutex::new(None);
 
-/// Enumerate and cache all instance fields for a class (including inherited).
+/// Enumerate and cache all fields (instance + static) for a class (including inherited).
 /// Must be called from a safe thread (not a hook callback).
 pub(super) unsafe fn cache_fields_for_class(
     env: JniEnv,
@@ -372,6 +393,7 @@ pub(super) unsafe fn cache_fields_for_class(
 
     // Resolve field IDs and store in cache
     let get_field_id: GetFieldIdFn = jni_fn!(env, GetFieldIdFn, JNI_GET_FIELD_ID);
+    let get_static_field_id: GetStaticFieldIdFn = jni_fn!(env, GetStaticFieldIdFn, JNI_GET_STATIC_FIELD_ID);
     let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
 
     let cls = find_class_safe(env, class_name);
@@ -380,7 +402,7 @@ pub(super) unsafe fn cache_fields_for_class(
     }
 
     let mut field_map = HashMap::new();
-    for (name, type_name) in &fields {
+    for (name, type_name, is_static) in &fields {
         let jni_sig = java_type_to_jni(type_name);
         let c_name = match CString::new(name.as_str()) {
             Ok(c) => c,
@@ -390,10 +412,14 @@ pub(super) unsafe fn cache_fields_for_class(
             Ok(c) => c,
             Err(_) => continue,
         };
-        // IMPORTANT: Always clear pending exceptions before calling GetFieldID.
+        // IMPORTANT: Always clear pending exceptions before calling Get[Static]FieldID.
         // GetFieldID will abort (SIGABRT) if there's already a pending exception.
         jni_check_exc(env);
-        let fid = get_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr());
+        let fid = if *is_static {
+            get_static_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr())
+        } else {
+            get_field_id(env, cls, c_name.as_ptr(), c_sig.as_ptr())
+        };
         if fid.is_null() {
             jni_check_exc(env); // Clear exception from failed GetFieldID
             continue;
@@ -403,6 +429,7 @@ pub(super) unsafe fn cache_fields_for_class(
             CachedFieldInfo {
                 jni_sig,
                 field_id: fid,
+                is_static: *is_static,
             },
         );
     }
@@ -416,11 +443,11 @@ pub(super) unsafe fn cache_fields_for_class(
 }
 
 /// Enumerate fields of a class and all its superclasses via JNI reflection.
-/// Returns Vec<(fieldName, typeName)>.
+/// Returns Vec<(fieldName, typeName, is_static)>.
 unsafe fn enumerate_class_fields(
     env: JniEnv,
     class_name: &str,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Vec<(String, String, bool)>, String> {
     use std::ffi::CStr;
 
     let reflect = REFLECT_IDS.get().ok_or("reflection IDs not cached")?;
@@ -428,6 +455,7 @@ unsafe fn enumerate_class_fields(
     let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
     let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
     let call_obj: CallObjectMethodAFn = jni_fn!(env, CallObjectMethodAFn, JNI_CALL_OBJECT_METHOD_A);
+    let call_int: CallIntMethodAFn = jni_fn!(env, CallIntMethodAFn, JNI_CALL_INT_METHOD_A);
     let get_str: GetStringUtfCharsFn = jni_fn!(env, GetStringUtfCharsFn, JNI_GET_STRING_UTF_CHARS);
     let rel_str: ReleaseStringUtfCharsFn = jni_fn!(env, ReleaseStringUtfCharsFn, JNI_RELEASE_STRING_UTF_CHARS);
     let get_arr_len: GetArrayLengthFn = jni_fn!(env, GetArrayLengthFn, JNI_GET_ARRAY_LENGTH);
@@ -459,11 +487,14 @@ unsafe fn enumerate_class_fields(
     let c_str_sig = CString::new("()Ljava/lang/String;").unwrap();
     let c_get_type = CString::new("getType").unwrap();
     let c_get_type_sig = CString::new("()Ljava/lang/Class;").unwrap();
+    let c_get_mods = CString::new("getModifiers").unwrap();
+    let c_get_mods_sig = CString::new("()I").unwrap();
 
     let get_fields_mid = get_mid(env, class_cls, c_get_fields.as_ptr(), c_get_fields_sig.as_ptr());
     let get_declared_fields_mid = get_mid(env, class_cls, c_get_declared_fields.as_ptr(), c_get_fields_sig.as_ptr());
     let field_get_name_mid = get_mid(env, field_cls, c_get_name.as_ptr(), c_str_sig.as_ptr());
     let field_get_type_mid = get_mid(env, field_cls, c_get_type.as_ptr(), c_get_type_sig.as_ptr());
+    let field_get_mods_mid = get_mid(env, field_cls, c_get_mods.as_ptr(), c_get_mods_sig.as_ptr());
 
     jni_check_exc(env);
 
@@ -487,6 +518,14 @@ unsafe fn enumerate_class_fields(
 
             if seen.contains(&name) { continue; }
 
+            // getModifiers() — check for static (0x0008)
+            let modifiers = if !field_get_mods_mid.is_null() {
+                call_int(env, field, field_get_mods_mid, std::ptr::null())
+            } else {
+                0
+            };
+            let is_static = (modifiers & 0x0008) != 0;
+
             // getType().getName()
             let type_cls_obj = call_obj(env, field, field_get_type_mid, std::ptr::null());
             if type_cls_obj.is_null() { continue; }
@@ -497,18 +536,18 @@ unsafe fn enumerate_class_fields(
             rel_str(env, type_name_jstr, tc);
 
             seen.insert(name.clone());
-            results.push((name, type_name));
+            results.push((name, type_name, is_static));
         }
     };
 
-    // getDeclaredFields() — own fields (including private)
+    // getDeclaredFields() — own fields (including private, static)
     if !get_declared_fields_mid.is_null() {
         let arr = call_obj(env, cls, get_declared_fields_mid, std::ptr::null());
         if jni_check_exc(env) { /* skip */ }
         else { extract_fields(arr); }
     }
 
-    // getFields() — all public inherited fields
+    // getFields() — all public inherited fields (including static)
     if !get_fields_mid.is_null() {
         let arr = call_obj(env, cls, get_fields_mid, std::ptr::null());
         if jni_check_exc(env) { /* skip */ }

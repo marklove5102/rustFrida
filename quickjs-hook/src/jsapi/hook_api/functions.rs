@@ -74,6 +74,23 @@ pub(crate) unsafe extern "C" fn js_hook(
         16,
     );
 
+    // Install the hook first, only register callback on success
+    let result = hook_ffi::hook_attach(
+        addr as *mut std::ffi::c_void,
+        Some(hook_callback_wrapper),
+        None,                          // No on_leave callback for now
+        addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
+        if stealth { 1 } else { 0 },
+    );
+
+    if result != HOOK_OK {
+        // hook 安装失败，释放 JS 回调引用
+        ffi::qjs_free_value(ctx, callback_dup);
+        let err_msg = hook_error_message(result);
+        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
+    }
+
+    // Hook installed successfully — store callback in registry
     {
         let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let registry = guard.as_mut().unwrap();
@@ -84,29 +101,6 @@ pub(crate) unsafe extern "C" fn js_hook(
                 callback_bytes,
             },
         );
-    }
-
-    // Install the hook
-    let result = hook_ffi::hook_attach(
-        addr as *mut std::ffi::c_void,
-        Some(hook_callback_wrapper),
-        None,                          // No on_leave callback for now
-        addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
-        if stealth { 1 } else { 0 },
-    );
-
-    if result != HOOK_OK {
-        // Failed - cleanup
-        let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(registry) = guard.as_mut() {
-            if let Some(data) = registry.remove(&addr) {
-                let callback: ffi::JSValue =
-                    std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);
-                ffi::qjs_free_value(ctx, callback);
-            }
-        }
-        let err_msg = hook_error_message(result);
-        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
     }
 
     JSValue::bool(true).raw()
@@ -209,6 +203,19 @@ pub(crate) unsafe extern "C" fn js_call_native(
             ctx,
             b"callNative() address is not mapped\0".as_ptr() as *const _,
         );
+    }
+
+    // Verify the address is in a known executable segment via dladdr.
+    // is_addr_accessible only checks if the page is resident, not if it's code.
+    // Calling a data pointer or non-executable page would SIGSEGV/SIGILL crash.
+    {
+        let mut info: libc::Dl_info = unsafe { std::mem::zeroed() };
+        if unsafe { libc::dladdr(addr as *const std::ffi::c_void, &mut info) } == 0 {
+            return ffi::JS_ThrowRangeError(
+                ctx,
+                b"callNative() address is not in an executable segment\0".as_ptr() as *const _,
+            );
+        }
     }
 
     // Extract up to 6 integer/pointer arguments (argv[1..6]), passed via x0-x5.

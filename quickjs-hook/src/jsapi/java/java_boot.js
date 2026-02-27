@@ -36,14 +36,15 @@
         });
     }
 
-    function MethodWrapper(cls, method, sig) {
+    function MethodWrapper(cls, method, sig, cache) {
         this._c = cls;
         this._m = method;
         this._s = sig || null;
+        this._cache = cache || null;
     }
 
     MethodWrapper.prototype.overload = function(sig) {
-        return new MethodWrapper(this._c, this._m, sig);
+        return new MethodWrapper(this._c, this._m, sig, this._cache);
     };
 
     Object.defineProperty(MethodWrapper.prototype, "impl", {
@@ -52,7 +53,13 @@
             var sig = this._s;
             var name = this._m === "$init" ? "<init>" : this._m;
             if (!sig) {
-                var ms = _methods(this._c);
+                var ms;
+                if (this._cache && this._cache.methods) {
+                    ms = this._cache.methods;
+                } else {
+                    ms = _methods(this._c);
+                    if (this._cache) this._cache.methods = ms;
+                }
                 var match = [];
                 for (var i = 0; i < ms.length; i++) {
                     if (ms[i].name === name) match.push(ms[i]);
@@ -94,10 +101,13 @@
     });
 
     Java.use = function(cls) {
+        var cache = {};
+        var wrappers = {};
         return new Proxy({}, {
             get: function(_, prop) {
                 if (typeof prop !== "string") return undefined;
-                return new MethodWrapper(cls, prop);
+                if (!wrappers[prop]) wrappers[prop] = new MethodWrapper(cls, prop, null, cache);
+                return wrappers[prop];
             }
         });
     };

@@ -9,7 +9,10 @@ pub(crate) fn is_addr_accessible(addr: u64, size: usize) -> bool {
     unsafe {
         const PAGE_SIZE: usize = 0x1000;
         let page_addr = (addr as usize) & !(PAGE_SIZE - 1);
-        let end = (addr as usize).wrapping_add(size);
+        let end = match (addr as usize).checked_add(size) {
+            Some(e) => e,
+            None => return false, // overflow: address range wraps around
+        };
         let region_len = end.saturating_sub(page_addr);
         let pages = (region_len + PAGE_SIZE - 1) / PAGE_SIZE;
         let mut vec = vec![0u8; pages];

@@ -17,19 +17,19 @@ pub fn set_console_callback<F>(callback: F)
 where
     F: Fn(&str) + Send + 'static,
 {
-    let mut guard = CONSOLE_CALLBACK.lock().unwrap();
+    let mut guard = CONSOLE_CALLBACK.lock().unwrap_or_else(|e| e.into_inner());
     *guard = Some(Box::new(callback));
 }
 
 /// Clear the console callback
 pub fn clear_console_callback() {
-    let mut guard = CONSOLE_CALLBACK.lock().unwrap();
+    let mut guard = CONSOLE_CALLBACK.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
 /// Internal function to output console message
 pub(crate) fn output_message(msg: &str) {
-    let guard = CONSOLE_CALLBACK.lock().unwrap();
+    let guard = CONSOLE_CALLBACK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(callback) = guard.as_ref() {
         callback(msg);
     } else {
