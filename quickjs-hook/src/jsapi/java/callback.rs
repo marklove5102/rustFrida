@@ -10,6 +10,7 @@ use crate::value::JSValue;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use super::jni_core::*;
 
@@ -50,9 +51,10 @@ unsafe impl Sync for JavaHookData {}
 pub(super) static JAVA_HOOK_REGISTRY: Mutex<Option<HashMap<u64, JavaHookData>>> = Mutex::new(None);
 
 // Callback state globals — set before JS_Call in java_hook_callback, read by js_call_original.
-// Safe: only accessed under JS_ENGINE lock (single-threaded JS execution).
-pub(super) static mut CURRENT_HOOK_CTX_PTR: *mut hook_ffi::HookContext = std::ptr::null_mut();
-pub(super) static mut CURRENT_HOOK_ART_METHOD: u64 = 0;
+// Protected by JS_ENGINE lock (single-threaded JS execution). Use atomics to avoid UB from
+// static mut in multi-threaded context.
+pub(super) static CURRENT_HOOK_CTX_PTR: AtomicUsize = AtomicUsize::new(0);
+pub(super) static CURRENT_HOOK_ART_METHOD: AtomicU64 = AtomicU64::new(0);
 
 /// Parse JNI signature to extract the return type character.
 /// "(II)V" → b'V', "(Ljava/lang/String;)Ljava/lang/Object;" → b'L'
@@ -191,8 +193,8 @@ unsafe extern "C" fn js_call_original(
     _argc: i32,
     _argv: *mut ffi::JSValue,
 ) -> ffi::JSValue {
-    let art_method_addr = CURRENT_HOOK_ART_METHOD;
-    let ctx_ptr = CURRENT_HOOK_CTX_PTR;
+    let art_method_addr = CURRENT_HOOK_ART_METHOD.load(Ordering::Relaxed);
+    let ctx_ptr = CURRENT_HOOK_CTX_PTR.load(Ordering::Relaxed) as *mut hook_ffi::HookContext;
     if ctx_ptr.is_null() || art_method_addr == 0 {
         return ffi::JS_ThrowInternalError(
             ctx,
@@ -324,7 +326,12 @@ unsafe extern "C" fn js_call_original(
             if ret.is_null() {
                 ffi::qjs_null()
             } else {
-                ffi::JS_NewBigUint64(ctx, ret as u64)
+                let js_val = ffi::JS_NewBigUint64(ctx, ret as u64);
+                // 释放 JNI local ref，避免 local ref table 泄漏
+                let delete_local_ref: DeleteLocalRefFn =
+                    jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+                delete_local_ref(env, ret);
+                js_val
             }
         }
         _ => ffi::qjs_undefined(),
@@ -468,10 +475,21 @@ pub(super) unsafe extern "C" fn java_hook_callback(
          hook_data.param_types.clone())
     }; // lock released
 
-    // Serialize JS access via JS_ENGINE mutex (blocking — don't silently drop callbacks)
-    let _js_guard = match crate::JS_ENGINE.lock() {
+    // Serialize JS access via JS_ENGINE mutex.
+    // Use try_lock() to prevent same-thread deadlock: if JS thread executes JS → JNI → hooked
+    // method, JS thread already holds JS_ENGINE → blocking lock() would deadlock.
+    // Same pattern as hook_api/callback.rs.
+    let _js_guard = match crate::JS_ENGINE.try_lock() {
         Ok(g) => g,
-        Err(e) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // JS 线程已持有锁（重入调用）或另一线程正在执行回调，跳过以避免死锁
+            output_message(&format!(
+                "[java hook] callback skipped (JS engine busy), art_method={:#x}",
+                art_method_addr
+            ));
+            return;
+        }
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
     };
 
     let ctx = ctx_usize as *mut ffi::JSContext;
@@ -482,8 +500,8 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     ffi::qjs_update_stack_top(ctx);
 
     // Set callback state globals for js_call_original
-    CURRENT_HOOK_CTX_PTR = ctx_ptr;
-    CURRENT_HOOK_ART_METHOD = art_method_addr;
+    CURRENT_HOOK_CTX_PTR.store(ctx_ptr as usize, Ordering::Relaxed);
+    CURRENT_HOOK_ART_METHOD.store(art_method_addr, Ordering::Relaxed);
 
     // Build context object
     let js_ctx = ffi::JS_NewObject(ctx);
@@ -491,6 +509,9 @@ pub(super) unsafe extern "C" fn java_hook_callback(
 
     // JNI calling convention: x0=JNIEnv*, x1=this/class, x2+=args
     // Add thisObj for instance methods (x1 = jobject this)
+    // NOTE: thisObj 和 object 类型参数使用 ART 传入的原始 local ref（x 寄存器中的 jobject）。
+    // 这些 local ref 在 hook callback 返回前有效。JS callback 中不应异步存储这些值。
+    // 如需跨 callback 持久化，需在 JS 侧调用 Java 方法创建 global ref。
     if !is_static {
         let val = ffi::JS_NewBigUint64(ctx, hook_ctx.x[1]);
         JSValue(js_ctx).set_property(ctx, "thisObj", JSValue(val));
@@ -582,8 +603,8 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     }
 
     // Clear callback state globals
-    CURRENT_HOOK_CTX_PTR = std::ptr::null_mut();
-    CURRENT_HOOK_ART_METHOD = 0;
+    CURRENT_HOOK_CTX_PTR.store(0, Ordering::Relaxed);
+    CURRENT_HOOK_ART_METHOD.store(0, Ordering::Relaxed);
 
     ffi::qjs_free_value(ctx, js_ctx);
     ffi::qjs_free_value(ctx, result);

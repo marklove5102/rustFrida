@@ -97,9 +97,20 @@ pub fn register_java_api(ctx: &JSContext) {
 }
 
 /// Cleanup all Java hooks (call before dropping context)
+///
+/// 调用路径: JSEngine::drop() → cleanup_java_hooks()
+/// 此时 JS_ENGINE 锁已被当前线程持有（cleanup_engine() 中 `*engine = None` 触发 drop），
+/// 因此不能再次 lock()（非重入锁会死锁）。使用 try_lock() 安全处理两种情况：
+/// - WouldBlock: 当前线程已持有锁（正常路径），JS callback 释放安全
+/// - Ok: 意外的非锁定路径调用，获取锁后释放 JS callback
 pub fn cleanup_java_hooks() {
     // Get JNIEnv for global ref cleanup (best effort)
     let env_opt = unsafe { get_thread_env().ok() };
+
+    // try_lock JS_ENGINE: 通常已被当前线程持有（从 drop 调用），
+    // WouldBlock 时说明当前线程已持有锁，JS 操作安全
+    let _js_guard = crate::JS_ENGINE.try_lock();
+    // 无论是否获取到锁，都继续清理（drop 路径下已持有锁）
 
     let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(registry) = guard.take() {
@@ -108,14 +119,23 @@ pub fn cleanup_java_hooks() {
                 // Remove native trampoline from hook engine
                 hook_ffi::hook_remove_redirect(data.art_method);
 
-                // Restore original ArtMethod state (access_flags_ + entry_point_ only; data_ was not modified)
+                // Restore original ArtMethod state (reverse order of installation:
+                // entry_point_ → access_flags_ → data_)
+                // This matches js_java_unhook() ordering for consistency.
                 if let Some(&ep_offset) = ENTRY_POINT_OFFSET.get() {
+                    // 1. Restore entry_point_ first (stop routing to JNI trampoline)
+                    let ep_ptr = (data.art_method as usize + ep_offset) as *mut u64;
+                    std::ptr::write_volatile(ep_ptr, data.original_entry_point);
+
+                    // 2. Restore access_flags_ (clears kAccNative)
                     let flags_ptr = (data.art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET)
                         as *mut u32;
                     std::ptr::write_volatile(flags_ptr, data.original_access_flags);
 
-                    let ep_ptr = (data.art_method as usize + ep_offset) as *mut u64;
-                    std::ptr::write_volatile(ep_ptr, data.original_entry_point);
+                    // 3. Restore data_ (was overwritten with thunk pointer)
+                    let data_ptr = (data.art_method as usize + data_offset_for(ep_offset))
+                        as *mut u64;
+                    std::ptr::write_volatile(data_ptr, data.original_data);
 
                     // 刷新指令缓存，确保 ArtMethod 恢复立即生效
                     hook_ffi::hook_flush_cache(
@@ -138,7 +158,8 @@ pub fn cleanup_java_hooks() {
                     }
                 }
 
-                // Free JS callback
+                // Free JS callback（此处 qjs_free_value 受 JS_ENGINE 锁保护——
+                // 在 drop 路径下当前线程已持有锁，其他 JS 操作不会并发）
                 let ctx = data.ctx as *mut ffi::JSContext;
                 let callback: ffi::JSValue =
                     std::ptr::read(data.callback_bytes.as_ptr() as *const ffi::JSValue);

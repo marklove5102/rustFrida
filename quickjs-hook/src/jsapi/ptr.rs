@@ -67,6 +67,11 @@ pub fn create_native_pointer(ctx: *mut ffi::JSContext, addr: u64) -> JSValue {
     unsafe {
         let obj = ffi::JS_NewObjectClass(ctx, class_id as i32);
 
+        // OOM 时 JS_NewObjectClass 返回 JS_EXCEPTION，不能在异常值上调用 JS_SetOpaque
+        if ffi::qjs_is_exception(obj) != 0 {
+            return JSValue(obj);
+        }
+
         // Store the address as opaque data
         let addr_ptr = Box::into_raw(Box::new(addr));
         ffi::JS_SetOpaque(obj, addr_ptr as *mut _);

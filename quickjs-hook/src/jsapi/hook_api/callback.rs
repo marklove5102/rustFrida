@@ -124,7 +124,16 @@ pub(crate) unsafe extern "C" fn hook_callback_wrapper(
             s
         } else {
             msg_prop.free(ctx);
-            exc_val.to_string(ctx).unwrap_or_else(|| "[unknown exception]".to_string())
+            let fallback = exc_val.to_string(ctx).unwrap_or_else(|| "[unknown exception]".to_string());
+            // exc_val.to_string 内部调用 JS_ToCString 可能触发二次异常（例如
+            // toString() 方法本身抛出），残留在 QuickJS 状态中会污染后续执行。
+            // 消费掉可能的二次异常。
+            let secondary = ffi::JS_GetException(ctx);
+            let secondary_val = JSValue(secondary);
+            if !secondary_val.is_null() && !secondary_val.is_undefined() {
+                secondary_val.free(ctx);
+            }
+            fallback
         };
         output_message(&format!("[hook error] {}", msg));
         exc_val.free(ctx);

@@ -210,6 +210,14 @@ pub(super) unsafe extern "C" fn js_java_hook(
 
     if thunk.is_null() {
         libc::free(clone_addr as *mut std::ffi::c_void);
+        // 释放 class global ref，避免泄漏
+        if class_global_ref != 0 {
+            if let Ok(env) = get_thread_env() {
+                let delete_global_ref: DeleteGlobalRefFn =
+                    jni_fn!(env, DeleteGlobalRefFn, JNI_DELETE_GLOBAL_REF);
+                delete_global_ref(env, class_global_ref as *mut std::ffi::c_void);
+            }
+        }
         let err = CString::new("hook_create_native_trampoline failed").unwrap();
         return ffi::JS_ThrowInternalError(ctx, err.as_ptr());
     }
@@ -360,21 +368,39 @@ pub(super) unsafe extern "C" fn js_java_unhook(
 
     let key = method_key(&class_name, &method_name, &actual_sig);
 
-    // Find and remove from registry
+    // 先查找 art_method 地址并移除 hook redirect（阻止新回调进入），
+    // 然后再从 registry 移除 entry 并释放资源。
+    // 这个顺序避免了并发 callback 已复制旧数据但 entry 已被释放的竞态。
+    let art_method_addr = {
+        let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(registry) = guard.as_ref() {
+            registry
+                .iter()
+                .find(|(_, v)| v.method_key == key)
+                .map(|(k, _)| *k)
+        } else {
+            None
+        }
+    };
+
+    let art_method_addr = match art_method_addr {
+        Some(am) => am,
+        None => {
+            return ffi::JS_ThrowInternalError(
+                ctx,
+                b"method not hooked\0".as_ptr() as *const _,
+            );
+        }
+    };
+
+    // 1. 先移除 hook redirect，阻止新的 callback 触发
+    hook_ffi::hook_remove_redirect(art_method_addr);
+
+    // 2. 再从 registry 移除 entry（此时不会有新 callback 读取此 entry）
     let hook_data = {
         let mut guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_mut() {
-            // Find by method_key
-            let art_method = registry
-                .iter()
-                .find(|(_, v)| v.method_key == key)
-                .map(|(k, _)| *k);
-
-            if let Some(am) = art_method {
-                registry.remove(&am)
-            } else {
-                None
-            }
+            registry.remove(&art_method_addr)
         } else {
             None
         }
@@ -389,9 +415,6 @@ pub(super) unsafe extern "C" fn js_java_unhook(
             );
         }
     };
-
-    // Remove the native trampoline from the hook engine
-    hook_ffi::hook_remove_redirect(hook_data.art_method);
 
     // Restore original ArtMethod state (data_ + access_flags_ + entry_point_)
     // Order: entry_point_ first → flags → data_ (reverse of hook installation)

@@ -74,23 +74,9 @@ pub(crate) unsafe extern "C" fn js_hook(
         16,
     );
 
-    // Install the hook first, only register callback on success
-    let result = hook_ffi::hook_attach(
-        addr as *mut std::ffi::c_void,
-        Some(hook_callback_wrapper),
-        None,                          // No on_leave callback for now
-        addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
-        if stealth { 1 } else { 0 },
-    );
-
-    if result != HOOK_OK {
-        // hook 安装失败，释放 JS 回调引用
-        ffi::qjs_free_value(ctx, callback_dup);
-        let err_msg = hook_error_message(result);
-        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
-    }
-
-    // Hook installed successfully — store callback in registry
+    // 先将 callback 插入 registry，再安装 hook。
+    // 避免 TOCTOU 窗口：hook_attach 成功后 hook 立即激活，如果 callback
+    // 还未插入 registry，回调线程会在 HOOK_REGISTRY 中找不到数据。
     {
         let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         let registry = guard.as_mut().unwrap();
@@ -101,6 +87,27 @@ pub(crate) unsafe extern "C" fn js_hook(
                 callback_bytes,
             },
         );
+    }
+
+    let result = hook_ffi::hook_attach(
+        addr as *mut std::ffi::c_void,
+        Some(hook_callback_wrapper),
+        None,                          // No on_leave callback for now
+        addr as *mut std::ffi::c_void, // Use address as user_data to look up callback
+        if stealth { 1 } else { 0 },
+    );
+
+    if result != HOOK_OK {
+        // hook 安装失败，回滚 registry 并释放 JS 回调引用
+        {
+            let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(registry) = guard.as_mut() {
+                registry.remove(&addr);
+            }
+        }
+        ffi::qjs_free_value(ctx, callback_dup);
+        let err_msg = hook_error_message(result);
+        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
     }
 
     JSValue::bool(true).raw()
@@ -133,7 +140,16 @@ pub(crate) unsafe extern "C" fn js_unhook(
         },
     };
 
-    // Remove from registry and free callback
+    // 先移除 hook（阻止新回调进入），再从 registry 移除并释放 callback。
+    // 颠倒顺序会导致 use-after-free：窗口期内回调线程可能用已释放的 JSValue 调用 JS_Call。
+    let result = hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
+
+    if result != HOOK_OK {
+        let err_msg = hook_error_message(result);
+        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
+    }
+
+    // hook 已移除，不会再有新回调触发，安全释放 callback
     {
         let mut guard = HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(registry) = guard.as_mut() {
@@ -144,14 +160,6 @@ pub(crate) unsafe extern "C" fn js_unhook(
                 ffi::qjs_free_value(ctx, callback);
             }
         }
-    }
-
-    // Remove the hook
-    let result = hook_ffi::hook_remove(addr as *mut std::ffi::c_void);
-
-    if result != HOOK_OK {
-        let err_msg = hook_error_message(result);
-        return ffi::JS_ThrowInternalError(ctx, err_msg.as_ptr() as *const _);
     }
 
     JSValue::bool(true).raw()

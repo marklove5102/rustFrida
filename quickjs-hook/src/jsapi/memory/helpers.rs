@@ -53,7 +53,7 @@ pub(super) fn is_page_writable(addr: u64) -> bool {
 /// if they are currently mapped R-X (e.g. code pages).
 ///
 /// Returns `true` on success, `false` if mprotect fails.
-pub(super) unsafe fn write_with_perm(addr: u64, _size: usize, write_fn: impl FnOnce()) -> bool {
+pub(super) unsafe fn write_with_perm(addr: u64, size: usize, write_fn: impl FnOnce()) -> bool {
     let orig_prot = get_page_prot(addr);
     if orig_prot.map_or(true, |p| (p & libc::PROT_WRITE) != 0) {
         // Already writable (or can't determine)
@@ -63,22 +63,33 @@ pub(super) unsafe fn write_with_perm(addr: u64, _size: usize, write_fn: impl FnO
     let orig_prot = orig_prot.unwrap(); // safe: we checked Some above
     // Page is not writable. Temporarily add PROT_WRITE.
     const PAGE_SIZE: usize = 0x1000;
-    let page_start = (addr as usize) & !(PAGE_SIZE - 1);
-    // Cover two pages in case the write straddles a page boundary.
+    let start_page = (addr as usize) & !(PAGE_SIZE - 1);
+    // 计算写入是否跨页，只对需要的页进行 mprotect
+    let end_page = ((addr as usize) + size - 1) & !(PAGE_SIZE - 1);
+    let mprotect_len = if start_page == end_page {
+        PAGE_SIZE
+    } else {
+        PAGE_SIZE * 2
+    };
     if libc::mprotect(
-        page_start as *mut libc::c_void,
-        PAGE_SIZE * 2,
+        start_page as *mut libc::c_void,
+        mprotect_len,
         orig_prot | libc::PROT_WRITE,
     ) != 0
     {
         return false;
     }
     write_fn();
-    // Restore original permissions.
-    libc::mprotect(
-        page_start as *mut libc::c_void,
-        PAGE_SIZE * 2,
+    // 恢复原始权限，检查返回值
+    if libc::mprotect(
+        start_page as *mut libc::c_void,
+        mprotect_len,
         orig_prot,
-    );
+    ) != 0
+    {
+        crate::jsapi::console::output_message(
+            &format!("[warn] mprotect 恢复权限失败: addr=0x{:x}, len=0x{:x}", start_page, mprotect_len),
+        );
+    }
     true
 }

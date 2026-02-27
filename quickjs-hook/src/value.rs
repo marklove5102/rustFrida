@@ -38,9 +38,12 @@ impl JSValue {
     }
 
     /// Create a string value
+    /// 直接传 Rust &str 的原始字节，JS_NewStringLen 不要求 null termination，
+    /// 因此内嵌 \0 字节也能正确处理。
     pub fn string(ctx: *mut ffi::JSContext, s: &str) -> Self {
-        let cstr = CString::new(s).unwrap_or_else(|_| CString::new("").unwrap());
-        let val = unsafe { ffi::JS_NewStringLen(ctx, cstr.as_ptr(), s.len()) };
+        let val = unsafe {
+            ffi::JS_NewStringLen(ctx, s.as_ptr() as *const std::ffi::c_char, s.len())
+        };
         JSValue(val)
     }
 

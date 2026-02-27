@@ -396,8 +396,12 @@ void* hook_install(void* target, void* replacement, int stealth) {
      * pages on Android 10+ where VMA says r-xp but PTEs have read bit cleared).
      * Passing original_bytes to the relocator avoids re-reading the XOM page. */
     if (read_target_safe(target, entry->original_bytes, MIN_HOOK_SIZE) != 0) {
-        /* All safe methods failed — last resort direct read (may SIGSEGV on XOM) */
-        memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
+        /* 目标地址不可读（未映射或受保护），无法安装 hook */
+        hook_log("hook_install: target %p is not readable, aborting", target);
+        free_entry(entry);
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return NULL;
     }
     entry->original_size = MIN_HOOK_SIZE;
 
@@ -633,7 +637,12 @@ int hook_attach(void* target, HookCallback on_enter, HookCallback on_leave, void
     /* Save original bytes — use XOM-safe read (bypasses hardware execute-only
      * pages on Android 10+ where VMA says r-xp but PTEs have read bit cleared). */
     if (read_target_safe(target, entry->original_bytes, MIN_HOOK_SIZE) != 0) {
-        memcpy(entry->original_bytes, target, MIN_HOOK_SIZE);
+        /* 目标地址不可读（未映射或受保护），无法安装 hook */
+        hook_log("hook_attach: target %p is not readable, aborting", target);
+        free_entry(entry);
+        pool_make_executable();
+        pthread_mutex_unlock(&g_engine.lock);
+        return HOOK_ERROR_ALLOC_FAILED;
     }
     entry->original_size = MIN_HOOK_SIZE;
 
