@@ -6,7 +6,6 @@ use crate::OUTPUT_PATH;
 use crossbeam_channel::{bounded, Sender};
 use lazy_static::lazy_static;
 use prost::Message;
-use std::cell::UnsafeCell;
 use std::ffi::c_void;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -48,10 +47,7 @@ pub struct ExternalReturn {
     return_value: u64,
 }
 
-// 全局 QBDI VM 包装器
-struct VMCell(UnsafeCell<VM>);
-unsafe impl Sync for VMCell {}
-unsafe impl Send for VMCell {}
+define_sync_cell!(VMCell, VM);
 
 static GLOBAL_VM: OnceLock<VMCell> = OnceLock::new();
 

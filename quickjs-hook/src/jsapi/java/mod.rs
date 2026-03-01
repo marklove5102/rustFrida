@@ -27,21 +27,28 @@ macro_rules! jni_fn {
     };
 }
 
+/// ARM64 PAC/TBI 位剥离掩码 — 保留 48-bit 规范虚拟地址
+/// MTE 设备上 bit 48-55 可能非零，必须用 48-bit 而非 56-bit 掩码
+pub(crate) const PAC_STRIP_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
+
 mod jni_core;
 mod reflect;
 mod art_method;
+mod art_thread;
+mod art_class;
 mod art_controller;
 mod callback;
 mod java_hook_api;
 mod java_field_api;
 mod java_method_list_api;
+mod safe_mem;
 
 use crate::context::JSContext;
 use crate::ffi;
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_message;
+use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
-use std::ffi::CString;
 
 use jni_core::*;
 use reflect::*;
@@ -51,17 +58,6 @@ use java_field_api::*;
 use java_method_list_api::*;
 use art_method::try_invalidate_jit_cache;
 use art_controller::{set_stealth_enabled, is_stealth_enabled};
-
-/// Add a CFunction method to a JS object.
-macro_rules! add_method {
-    ($ctx:expr, $obj:expr, $name:expr, $func:expr, $argc:expr) => {{
-        let cname = CString::new($name).unwrap();
-        let func_val = ffi::qjs_new_cfunction($ctx, Some($func), cname.as_ptr(), $argc);
-        let atom = ffi::JS_NewAtom($ctx, cname.as_ptr());
-        ffi::qjs_set_property($ctx, $obj, atom, func_val);
-        ffi::JS_FreeAtom($ctx, atom);
-    }};
-}
 
 /// JS CFunction: Java.deopt() — 清空 JIT 缓存 (InvalidateAllMethods)
 /// 返回 true/false 表示操作是否成功
@@ -102,12 +98,12 @@ unsafe extern "C" fn js_art_router_debug(
         let guard = JAVA_HOOK_REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref registry) = *guard {
             for (art_method, data) in registry.iter() {
-                if let Some(&ep_offset) = jni_core::ENTRY_POINT_OFFSET.get() {
+                if let Some(spec) = jni_core::ART_METHOD_SPEC.get() {
                     let current_ep = std::ptr::read_volatile(
-                        (*art_method as usize + ep_offset) as *const u64,
+                        (*art_method as usize + spec.entry_point_offset) as *const u64,
                     );
                     let current_flags = std::ptr::read_volatile(
-                        (*art_method as usize + jni_core::ART_METHOD_ACCESS_FLAGS_OFFSET) as *const u32,
+                        (*art_method as usize + spec.access_flags_offset) as *const u32,
                     );
                     output_message(&format!(
                         "[art_router_debug] ArtMethod={:#x}: current_ep={:#x} (original={:#x}), flags={:#x} (original={:#x})",
@@ -174,15 +170,16 @@ pub fn register_java_api(ctx: &JSContext) {
         // Create the "Java" namespace object
         let java_obj = ffi::JS_NewObject(ctx.as_ptr());
 
-        add_method!(ctx.as_ptr(), java_obj, "hook", js_java_hook, 4);
-        add_method!(ctx.as_ptr(), java_obj, "unhook", js_java_unhook, 3);
-        add_method!(ctx.as_ptr(), java_obj, "deopt", js_java_deopt, 0);
-        add_method!(ctx.as_ptr(), java_obj, "setStealth", js_java_set_stealth, 1);
-        add_method!(ctx.as_ptr(), java_obj, "getStealth", js_java_get_stealth, 0);
-        add_method!(ctx.as_ptr(), java_obj, "_artRouterDebug", js_art_router_debug, 0);
-        add_method!(ctx.as_ptr(), java_obj, "_methods", js_java_methods, 1);
-        add_method!(ctx.as_ptr(), java_obj, "_getFieldAuto", js_java_get_field_auto, 3);
-        add_method!(ctx.as_ptr(), java_obj, "getField", js_java_get_field, 4);
+        let ctx_ptr = ctx.as_ptr();
+        add_cfunction_to_object(ctx_ptr, java_obj, "hook", js_java_hook, 4);
+        add_cfunction_to_object(ctx_ptr, java_obj, "unhook", js_java_unhook, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "deopt", js_java_deopt, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "setStealth", js_java_set_stealth, 1);
+        add_cfunction_to_object(ctx_ptr, java_obj, "getStealth", js_java_get_stealth, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_artRouterDebug", js_art_router_debug, 0);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_methods", js_java_methods, 1);
+        add_cfunction_to_object(ctx_ptr, java_obj, "_getFieldAuto", js_java_get_field_auto, 3);
+        add_cfunction_to_object(ctx_ptr, java_obj, "getField", js_java_get_field, 4);
 
         // Set Java object on global
         global.set_property(ctx.as_ptr(), "Java", JSValue(java_obj));
@@ -233,10 +230,11 @@ pub fn cleanup_java_hooks() {
                         hook_ffi::hook_remove_redirect(data.art_method);
 
                         // 恢复全部 ArtMethod 字段
-                        if let Some(&ep_offset) = ENTRY_POINT_OFFSET.get() {
-                            let data_off = jni_core::data_offset_for(ep_offset);
+                        if let Some(spec) = ART_METHOD_SPEC.get() {
+                            let ep_offset = spec.entry_point_offset;
+                            let data_off = spec.data_offset;
 
-                            let flags_ptr = (data.art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET)
+                            let flags_ptr = (data.art_method as usize + spec.access_flags_offset)
                                 as *mut u32;
                             std::ptr::write_volatile(flags_ptr, data.original_access_flags);
 

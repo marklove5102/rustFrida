@@ -4,31 +4,35 @@
 //! entry_point offset probing, JNI state management.
 
 use crate::jsapi::console::output_message;
+use crate::jsapi::module::probe_module_range;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::sync::Mutex;
 
+use super::PAC_STRIP_MASK;
+use super::reflect::decode_method_id;
+use super::safe_mem::{refresh_mem_regions, safe_read_u32, safe_read_u64};
+
 // ============================================================================
-// ArtMethod layout constants (ARM64 Android 8+)
+// ArtMethod layout — dynamic probing (Frida-style)
 // ============================================================================
 
-/// Offset of access_flags_ in ArtMethod
-pub(super) const ART_METHOD_ACCESS_FLAGS_OFFSET: usize = 4;
-
-/// Get the data_ offset for a given entry_point offset.
-/// data_ and entry_point_ are adjacent in ArtMethod::PtrSizedFields:
-///   struct PtrSizedFields { data_: ptr, entry_point_from_quick_compiled_code_: ptr }
-/// So data_ is always at ep_offset - 8 (pointer size on ARM64).
-#[inline]
-pub(super) fn data_offset_for(ep_offset: usize) -> usize {
-    ep_offset - 8
+/// 动态探测的 ArtMethod 布局规格（Frida-style）
+///
+/// 通过扫描已知 native 方法 (Process.getElapsedCpuTime) 的 ArtMethod 内存，
+/// 动态发现 access_flags、data_ (jniCode)、entry_point_ 偏移。
+/// 兼容厂商魔改 ArtMethod 布局。
+pub(super) struct ArtMethodSpec {
+    pub(super) access_flags_offset: usize,
+    pub(super) data_offset: usize,        // jniCode / data_
+    pub(super) entry_point_offset: usize,  // quickCode / entry_point_
+    pub(super) size: usize,                // ArtMethod 总大小
 }
+
+pub(super) static ART_METHOD_SPEC: std::sync::OnceLock<ArtMethodSpec> = std::sync::OnceLock::new();
 
 /// kAccNative — marks method as native (ART uses JNI trampoline to call data_)
 pub(super) const K_ACC_NATIVE: u32 = 0x0100;
-/// kAccCompileDontBother — prevents JIT from recompiling the method
-/// API >= 27: 0x02000000, API 24-26: 0x01000000, API < 24: 0
-pub(super) const K_ACC_COMPILE_DONT_BOTHER: u32 = 0x02000000;
 /// kAccFastInterpreterToInterpreterInvoke — fast interpreter dispatch (must clear for native)
 pub(super) const K_ACC_FAST_INTERP_TO_INTERP: u32 = 0x40000000;
 /// kAccSingleImplementation — devirtualization optimization (must clear for hooked methods)
@@ -45,11 +49,24 @@ pub(super) const K_ACC_SKIP_ACCESS_CHECKS: u32 = 0x00080000;
 pub(super) const K_ACC_NTERP_ENTRY_POINT_FAST_PATH: u32 = 0x00100000;
 /// kAccXposedHookedMethod — Xposed framework hooked method marker
 pub(super) const K_ACC_XPOSED_HOOKED_METHOD: u32 = 0x10000000;
+/// kAccNterpInvokeFastPathFlag — nterp invoke fast path (noise bit, may be set on probed method)
+pub(super) const K_ACC_NTERP_INVOKE_FAST_PATH_FLAG: u32 = 0x00200000;
+/// kAccPublicApi — public API whitelist marker (noise bit, may be set on probed method)
+pub(super) const K_ACC_PUBLIC_API: u32 = 0x10000000;
 
-/// Cached entry_point offset, determined at runtime.
-/// Android 12 emulator uses 24 (no separate data_ field, 32-byte ArtMethod).
-/// Standard AOSP uses 32 (data_ at 24, 40-byte ArtMethod).
-pub(super) static ENTRY_POINT_OFFSET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+/// 缓存的 kAccCompileDontBother 位值
+static K_ACC_COMPILE_DONT_BOTHER_CACHED: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// 按 API 级别返回 kAccCompileDontBother 的正确位值 (cached)。
+/// API >= 27: 0x02000000, API 24-26: 0x01000000, API < 24: 0
+pub(super) fn k_acc_compile_dont_bother() -> u32 {
+    *K_ACC_COMPILE_DONT_BOTHER_CACHED.get_or_init(|| {
+        let api = get_android_api_level();
+        if api >= 27 { 0x02000000 }
+        else if api >= 24 { 0x01000000 }
+        else { 0 }
+    })
+}
 
 // ============================================================================
 // JNI type aliases + helpers (module-level, shared across all functions)
@@ -94,6 +111,9 @@ pub(super) type CallIntMethodAFn = unsafe extern "C" fn(
     JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, *const std::ffi::c_void,
 ) -> i32;
 pub(super) type ToReflectedMethodFn = unsafe extern "C" fn(
+    JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8,
+) -> *mut std::ffi::c_void;
+pub(super) type ToReflectedFieldFn = unsafe extern "C" fn(
     JniEnv, *mut std::ffi::c_void, *mut std::ffi::c_void, u8,
 ) -> *mut std::ffi::c_void;
 pub(super) type GetLongFieldFn = unsafe extern "C" fn(
@@ -183,7 +203,7 @@ pub(super) unsafe fn jni_check_exc(env: JniEnv) -> bool {
 /// After stripping, verifies via dladdr that the address is in a mapped executable region.
 pub(super) fn is_code_pointer(val: u64) -> bool {
     // Strip PAC/TBI bits to get the bare virtual address (48-bit canonical form)
-    let stripped = val & 0x0000_FFFF_FFFF_FFFF;
+    let stripped = val & PAC_STRIP_MASK;
     if stripped == 0 {
         return false;
     }
@@ -194,30 +214,230 @@ pub(super) fn is_code_pointer(val: u64) -> bool {
     }
 }
 
-/// Get Android API level from system property ro.build.version.sdk.
-pub(super) fn get_android_api_level() -> i32 {
-    let prop = CString::new("ro.build.version.sdk").unwrap();
-    let mut buf = [0u8; 32];
-    // __system_property_get is always available on Android
-    unsafe {
-        let get_prop: unsafe extern "C" fn(*const c_char, *mut c_char) -> i32 =
-            std::mem::transmute(libc::dlsym(
-                libc::RTLD_DEFAULT,
-                b"__system_property_get\0".as_ptr() as *const _,
-            ));
-        get_prop(prop.as_ptr(), buf.as_mut_ptr() as *mut c_char);
-    }
-    let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) };
-    s.to_str().unwrap_or("0").parse().unwrap_or(0)
+/// 缓存的 Android API level
+static ANDROID_API_LEVEL: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+/// 缓存的 Android codename
+static ANDROID_CODENAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// 读取 Android 系统属性值
+unsafe fn read_system_property(name: &str, buf: &mut [u8]) {
+    let prop = CString::new(name).unwrap();
+    let get_prop: unsafe extern "C" fn(*const c_char, *mut c_char) -> i32 =
+        std::mem::transmute(libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"__system_property_get\0".as_ptr() as *const _,
+        ));
+    get_prop(prop.as_ptr(), buf.as_mut_ptr() as *mut c_char);
 }
 
-/// Determine the entry_point_from_quick_compiled_code_ offset by probing.
+/// Get Android API level from system property ro.build.version.sdk (cached).
+pub(super) fn get_android_api_level() -> i32 {
+    *ANDROID_API_LEVEL.get_or_init(|| {
+        let mut buf = [0u8; 32];
+        unsafe { read_system_property("ro.build.version.sdk", &mut buf) };
+        let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        s.to_str().unwrap_or("0").parse().unwrap_or(0)
+    })
+}
+
+/// Get Android version codename from system property ro.build.version.codename (cached).
+/// Returns "REL" for release builds, or a codename (e.g. "R", "S", "Tiramisu") for preview builds.
+pub(super) fn get_android_codename() -> &'static str {
+    ANDROID_CODENAME.get_or_init(|| {
+        let mut buf = [0u8; 64];
+        unsafe { read_system_property("ro.build.version.codename", &mut buf) };
+        let s = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr() as *const c_char) };
+        s.to_str().unwrap_or("").to_string()
+    })
+}
+
+/// Get the ArtMethodSpec, probing on first use (Frida-style dynamic discovery).
+pub(super) fn get_art_method_spec(env: JniEnv, art_method: u64) -> &'static ArtMethodSpec {
+    ART_METHOD_SPEC.get_or_init(|| probe_art_method_spec(env, art_method))
+}
+
+/// Probe ArtMethod layout specification.
 ///
-/// Strategy: read values at both candidate offsets (24 and 32) from a known method.
-/// The entry_point is the one that looks like a valid code pointer (canonical 48-bit VA
-/// resolvable by dladdr). The other offset is either data_ or the next ArtMethod.
-fn probe_entry_point_offset(env: JniEnv, target_art_method: u64) -> usize {
-    // Read candidate values at offset 24 and 32
+/// Strategy 1 (Frida-style): 扫描 Process.getElapsedCpuTime 的 ArtMethod 内存，
+/// 动态发现 access_flags、data_ (jniCode)、entry_point_ 偏移。
+///
+/// Strategy 2 (fallback): 退回 code pointer 探测逻辑，access_flags 默认 4。
+fn probe_art_method_spec(env: JniEnv, art_method: u64) -> ArtMethodSpec {
+    // Strategy 1: Frida-style full scan using known native method
+    if let Some(spec) = unsafe { probe_art_method_spec_frida(env) } {
+        return spec;
+    }
+
+    output_message("[art spec] Frida-style probe 失败，退回 entry_point 探测...");
+
+    // Strategy 2: Fallback — probe entry_point offset using code pointer heuristic
+    let ep_offset = probe_entry_point_offset_legacy(env, art_method);
+    let api_level = get_android_api_level();
+    let size = if api_level <= 21 { ep_offset + 32 } else { ep_offset + 8 };
+    ArtMethodSpec {
+        access_flags_offset: 4,        // AOSP default
+        data_offset: ep_offset - 8,    // data_ precedes entry_point_
+        entry_point_offset: ep_offset,
+        size,
+    }
+}
+
+/// Frida-style ArtMethod 布局全扫描。
+///
+/// 对标 Frida `_getArtMethodSpec()`: 通过 JNI 获取 Process.getElapsedCpuTime 的 ArtMethod*
+/// （已知 public|static|final|native），在单循环中独立扫描 access_flags 和 jniCode (data_) 偏移，
+/// 不假设两者的先后顺序（防御厂商魔改布局），推算 entry_point 偏移。
+unsafe fn probe_art_method_spec_frida(env: JniEnv) -> Option<ArtMethodSpec> {
+    // Step 1: 获取 Process.getElapsedCpuTime 的 ArtMethod*
+    let probe_method = get_known_native_art_method(env)?;
+
+    output_message(&format!(
+        "[art spec] 探测方法: Process.getElapsedCpuTime ArtMethod*={:#x}", probe_method
+    ));
+
+    // Step 2: 获取 libandroid_runtime.so 地址范围（native 实现所在）
+    let (rt_start, rt_end) = probe_module_range("libandroid_runtime.so");
+    if rt_start == 0 {
+        output_message("[art spec] libandroid_runtime.so 范围获取失败");
+        return None;
+    }
+
+    output_message(&format!(
+        "[art spec] libandroid_runtime.so range: {:#x}-{:#x}", rt_start, rt_end
+    ));
+
+    // 刷新内存映射缓存，保护后续扫描
+    refresh_mem_regions();
+
+    // Step 3: 单循环独立扫描 access_flags 和 jniCode（对标 Frida 的 remaining 计数器模式）
+    // 不假设 access_flags 在 jniCode 之前 — 两者独立检测，兼容厂商魔改布局
+    const EXPECTED_FLAGS: u32 = 0x0119; // kAccPublic|kAccStatic|kAccFinal|kAccNative
+    const NOISE_MASK: u32 = K_ACC_FAST_INTERP_TO_INTERP | K_ACC_PUBLIC_API | K_ACC_NTERP_INVOKE_FAST_PATH_FLAG;
+    const RELEVANT_MASK: u32 = !NOISE_MASK;
+    const MAX_SCAN: usize = 64;
+
+    let mut access_flags_offset: Option<usize> = None;
+    let mut data_offset: Option<usize> = None;
+    let mut remaining = 2u32;
+
+    for offset in (0..MAX_SCAN).step_by(4) {
+        if remaining == 0 {
+            break;
+        }
+
+        // 检测 access_flags: 过滤噪声位后匹配 public|static|final|native = 0x0119
+        if access_flags_offset.is_none() {
+            let val = safe_read_u32(probe_method + offset as u64);
+            if (val & RELEVANT_MASK) == EXPECTED_FLAGS {
+                access_flags_offset = Some(offset);
+                remaining -= 1;
+                output_message(&format!(
+                    "[art spec] access_flags 发现: offset={}, value={:#x}, masked={:#x}",
+                    offset, val, val & RELEVANT_MASK
+                ));
+            }
+        }
+
+        // 检测 jniCode (data_): 指针落在 libandroid_runtime.so 范围内
+        if data_offset.is_none() {
+            let val = safe_read_u64(probe_method + offset as u64);
+            // Strip PAC/TBI bits (bits 48-63)
+            let stripped = val & PAC_STRIP_MASK;
+            if stripped >= rt_start && stripped < rt_end {
+                data_offset = Some(offset);
+                remaining -= 1;
+                output_message(&format!(
+                    "[art spec] data_ (jniCode) 发现: offset={}, value={:#x}", offset, val
+                ));
+            }
+        }
+    }
+
+    let af_offset = match access_flags_offset {
+        Some(o) => o,
+        None => {
+            output_message("[art spec] access_flags 未找到");
+            return None;
+        }
+    };
+
+    let d_offset = match data_offset {
+        Some(o) => o,
+        None => {
+            output_message("[art spec] data_ (jniCode) 未找到 (expected in libandroid_runtime.so)");
+            return None;
+        }
+    };
+
+    // entry_point_ 紧跟 data_ 之后
+    // API <= 21: entrypointFieldSize = 8 (interpreter_to_interpreter + interpreter_to_compiled 各 4 字节)
+    // API >= 22: entrypointFieldSize = pointerSize (8 on ARM64)
+    // ARM64 上两者都是 8，但 size 计算不同
+    let api_level = get_android_api_level();
+    let ep_offset = d_offset + 8;
+    // 对标 Frida: API <= 21 ArtMethod 有额外 GC map/vmap 字段 → +32
+    //            API >= 22 entry_point 是最后一个字段 → +pointerSize(8)
+    let size = if api_level <= 21 { ep_offset + 32 } else { ep_offset + 8 };
+
+    output_message(&format!(
+        "[art spec] Frida-style 探测成功: access_flags={}, data_={}, entry_point={}, size={} (API {})",
+        af_offset, d_offset, ep_offset, size, api_level
+    ));
+
+    Some(ArtMethodSpec {
+        access_flags_offset: af_offset,
+        data_offset: d_offset,
+        entry_point_offset: ep_offset,
+        size,
+    })
+}
+
+/// 获取已知 native 静态方法的 ArtMethod* (Process.getElapsedCpuTime)。
+/// 该方法是 public static final native，flags 已知，用于 Frida-style 布局扫描。
+///
+/// 对标 Frida `unwrapMethodId(env.getStaticMethodId(...))`:
+/// API 30+ 可能返回 opaque jmethodID（bit 0 = 1），需解码为真实 ArtMethod*。
+unsafe fn get_known_native_art_method(env: JniEnv) -> Option<u64> {
+    let c_class = CString::new("android/os/Process").unwrap();
+    let c_method = CString::new("getElapsedCpuTime").unwrap();
+    let c_sig = CString::new("()J").unwrap();
+
+    let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
+    let get_static_mid: GetStaticMethodIdFn = jni_fn!(env, GetStaticMethodIdFn, JNI_GET_STATIC_METHOD_ID);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let cls = find_class(env, c_class.as_ptr());
+    if cls.is_null() || jni_check_exc(env) {
+        output_message("[art spec] FindClass(android/os/Process) 失败");
+        return None;
+    }
+
+    let mid = get_static_mid(env, cls, c_method.as_ptr(), c_sig.as_ptr());
+    if mid.is_null() || jni_check_exc(env) {
+        delete_local_ref(env, cls);
+        output_message("[art spec] GetStaticMethodID(getElapsedCpuTime) 失败");
+        return None;
+    }
+
+    // 解码 opaque jmethodID → 真实 ArtMethod* (API 30+ 安全)
+    // 对标 Frida 的 unwrapMethodId(): 如果 bit 0 = 0 则直接返回，否则通过反射解码
+    let art_method = decode_method_id(env, cls, mid as u64, true);
+    delete_local_ref(env, cls);
+
+    if art_method != mid as u64 {
+        output_message(&format!(
+            "[art spec] jmethodID 已解码: {:#x} → ArtMethod*={:#x}", mid as u64, art_method
+        ));
+    }
+
+    Some(art_method)
+}
+
+/// Legacy entry_point offset probing (fallback when Frida-style scan fails).
+///
+/// Strategy: read values at candidate offsets (24, 32) from a known method.
+/// The entry_point is the one that looks like a valid code pointer.
+fn probe_entry_point_offset_legacy(env: JniEnv, target_art_method: u64) -> usize {
     let val_24 = unsafe { *((target_art_method as usize + 24) as *const u64) };
     let val_32 = unsafe { *((target_art_method as usize + 32) as *const u64) };
 
@@ -225,38 +445,29 @@ fn probe_entry_point_offset(env: JniEnv, target_art_method: u64) -> usize {
     let is_32 = is_code_pointer(val_32);
 
     output_message(&format!(
-        "[java hook] probe: val_24={:#x} (code={}), val_32={:#x} (code={})",
+        "[art spec] legacy probe: val_24={:#x} (code={}), val_32={:#x} (code={})",
         val_24, is_24, val_32, is_32
     ));
 
     let offset = if is_24 && !is_32 {
-        24 // Only offset 24 is a code pointer → 32-byte ArtMethod
+        24
     } else if is_32 && !is_24 {
-        32 // Only offset 32 is a code pointer → 40-byte ArtMethod
+        32
     } else if is_24 && is_32 {
-        // Both look like code pointers — use stride detection as tiebreaker
         let cur_dex_idx = unsafe { *((target_art_method as usize + 12) as *const u32) };
         let next_32 = unsafe { *((target_art_method as usize + 32 + 12) as *const u32) };
-        if next_32 == cur_dex_idx + 1 {
-            24 // stride 32 confirmed → entry_point at 24
-        } else {
-            32 // assume 40-byte ArtMethod
-        }
+        if next_32 == cur_dex_idx + 1 { 24 } else { 32 }
     } else {
-        // Neither looks valid — try a secondary probe with Object.hashCode
-        probe_with_known_method(env).unwrap_or(24) // default to 24 (Android 12+)
+        // Neither looks valid — try Object.hashCode as secondary probe
+        probe_with_known_method_legacy(env).unwrap_or(24)
     };
 
-    output_message(&format!(
-        "[java hook] ArtMethod entry_point offset={}", offset,
-    ));
-
+    output_message(&format!("[art spec] legacy result: entry_point offset={}", offset));
     offset
 }
 
-/// Secondary probe using Object.hashCode() — a well-known non-native method
-/// that should have a valid entry_point.
-fn probe_with_known_method(env: JniEnv) -> Option<usize> {
+/// Secondary legacy probe using Object.hashCode().
+fn probe_with_known_method_legacy(env: JniEnv) -> Option<usize> {
     unsafe {
         let c_class = CString::new("java/lang/Object").unwrap();
         let c_method = CString::new("hashCode").unwrap();
@@ -283,20 +494,10 @@ fn probe_with_known_method(env: JniEnv) -> Option<usize> {
         let c24 = is_code_pointer(v24);
         let c32 = is_code_pointer(v32);
 
-        output_message(&format!(
-            "[java hook] secondary probe (Object.hashCode): val_24={:#x} (code={}), val_32={:#x} (code={})",
-            v24, c24, v32, c32
-        ));
-
         if c24 && !c32 { Some(24) }
         else if c32 && !c24 { Some(32) }
         else { None }
     }
-}
-
-/// Get the entry_point offset, probing on first use
-pub(super) fn get_entry_point_offset(env: JniEnv, art_method: u64) -> usize {
-    *ENTRY_POINT_OFFSET.get_or_init(|| probe_entry_point_offset(env, art_method))
 }
 
 // ============================================================================
@@ -305,6 +506,7 @@ pub(super) fn get_entry_point_offset(env: JniEnv, art_method: u64) -> usize {
 
 pub(super) const JNI_FIND_CLASS: usize = 6;
 pub(super) const JNI_TO_REFLECTED_METHOD: usize = 9;
+pub(super) const JNI_TO_REFLECTED_FIELD: usize = 12;
 pub(super) const JNI_EXCEPTION_CLEAR: usize = 17;
 pub(super) const JNI_PUSH_LOCAL_FRAME: usize = 19;
 pub(super) const JNI_POP_LOCAL_FRAME: usize = 20;
@@ -381,6 +583,20 @@ unsafe impl Send for JniState {}
 unsafe impl Sync for JniState {}
 
 pub(super) static JNI_STATE: Mutex<Option<JniState>> = Mutex::new(None);
+
+/// 从 JNI_STATE 获取 Runtime 地址 (JavaVMExt.runtime_ at offset 8)
+pub(super) unsafe fn get_runtime_addr() -> Option<u64> {
+    let vm_ptr = {
+        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(state) => state.vm,
+            None => return None,
+        }
+    };
+    let runtime_raw = *((vm_ptr as usize + 8) as *const u64);
+    let runtime = runtime_raw & PAC_STRIP_MASK;
+    if runtime == 0 { None } else { Some(runtime) }
+}
 
 /// Initialize JNI state by finding the existing JavaVM in the target process,
 /// then return a JNIEnv* for the **current thread** via AttachCurrentThread.
@@ -466,4 +682,327 @@ unsafe fn attach_current_thread(vm_ptr: *mut std::ffi::c_void) -> Result<JniEnv,
 pub(super) unsafe fn get_thread_env() -> Result<JniEnv, String> {
     // ensure_jni_initialized now always returns current thread's env
     ensure_jni_initialized()
+}
+
+// ============================================================================
+// API 34+ APEX 版本检测（对标 Frida isApiLevel34OrApexEquivalent / getArtApexVersion）
+// ============================================================================
+
+/// 缓存的 ART APEX 版本号
+static ART_APEX_VERSION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// 缓存的 API 34+ 等效判断结果
+static IS_API_34_OR_APEX_EQUIV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 获取 ART APEX 模块版本号（对标 Frida getArtApexVersion）
+///
+/// 解析 /proc/self/mountinfo，查找 /apex/com.android.art 相关挂载行，
+/// 提取版本号。如果挂载信息不可用，则 fallback 为 api_level * 10_000_000。
+pub(super) fn get_art_apex_version() -> u64 {
+    *ART_APEX_VERSION.get_or_init(|| {
+        let version = parse_art_apex_version();
+        output_message(&format!("[apex] ART APEX version: {}", version));
+        version
+    })
+}
+
+/// 判断当前环境是否等效于 API 34+（对标 Frida isApiLevel34OrApexEquivalent）
+///
+/// 通过 dlsym 检查 libart.so 是否导出 API 34 新增符号:
+/// - AppInfo::GetPrimaryApkReferenceProfile
+/// - Thread::RunFlipFunction(Thread*, bool)  (API 34 新增 bool 参数版本)
+///
+/// 任一存在即返回 true。用于处理 APEX 模块更新导致 ART 内部布局
+/// 与 SDK API 级别不一致的情况（如 API 33 设备安装了 API 34 的 ART APEX）。
+pub(super) fn is_api_level_34_or_apex_equivalent() -> bool {
+    *IS_API_34_OR_APEX_EQUIV.get_or_init(|| {
+        use crate::jsapi::module::libart_dlsym;
+
+        let result = unsafe {
+            // 检查 API 34 新增符号
+            let sym1 = libart_dlsym("_ZN3art7AppInfo29GetPrimaryApkReferenceProfileEv");
+            if !sym1.is_null() {
+                output_message("[apex] API 34+ 等效: 发现 AppInfo::GetPrimaryApkReferenceProfile");
+                return true;
+            }
+
+            // Thread::RunFlipFunction(Thread*, bool) — API 34 新增 bool 参数重载
+            let sym2 = libart_dlsym("_ZN3art6Thread15RunFlipFunctionEPS0_b");
+            if !sym2.is_null() {
+                output_message("[apex] API 34+ 等效: 发现 Thread::RunFlipFunction(Thread*, bool)");
+                return true;
+            }
+
+            false
+        };
+
+        if !result {
+            output_message("[apex] API 34+ 等效检测: 未发现特征符号");
+        }
+        result
+    })
+}
+
+// ============================================================================
+// JNI IDs Indirection — Frida-style 读取+按需解码 (对标 Frida unwrapGenericId)
+// ============================================================================
+
+/// JNI ID 解码能力缓存
+///
+/// 对标 Frida: 读取 Runtime.jni_ids_indirection_ 判断模式，
+/// 按需通过 JniIdManager::DecodeMethodId/DecodeFieldId 解码。
+/// 仅当 dlsym 解码函数不可用时，才 fallback 强制写 kPointer。
+struct JniIdDecoderState {
+    /// Runtime.jni_ids_indirection_ 字段地址 (用于每次读取当前模式)
+    indirection_field_addr: *const i32,
+    /// JniIdManager::DecodeMethodId 函数指针 (可能为 null)
+    decode_method_id_fn: Option<DecodeIdFn>,
+    /// JniIdManager::DecodeFieldId 函数指针 (可能为 null)
+    decode_field_id_fn: Option<DecodeIdFn>,
+    /// JniIdManager* 指针 (作为 DecodeMethodId/DecodeFieldId 的 this)
+    jni_id_manager: u64,
+    /// 是否已 fallback 强制写为 kPointer (当 decode 函数不可用时)
+    forced_pointer_mode: bool,
+}
+
+unsafe impl Send for JniIdDecoderState {}
+unsafe impl Sync for JniIdDecoderState {}
+
+/// C++ 成员函数签名: ArtMethod*/ArtField* DecodeXxxId(JniIdManager* this, jxxxID id)
+type DecodeIdFn = unsafe extern "C" fn(this: *mut std::ffi::c_void, id: *mut std::ffi::c_void) -> u64;
+
+/// kPointer = 0 (jmethodID 直接是 ArtMethod*)
+const K_POINTER: i32 = 0;
+
+static JNI_ID_DECODER: std::sync::OnceLock<Option<JniIdDecoderState>> = std::sync::OnceLock::new();
+
+/// 初始化 JNI ID 解码器（对标 Frida unwrapGenericId 的初始化部分）
+///
+/// Strategy:
+/// 1. 探测 jni_ids_indirection_ 偏移 → 获取字段地址（用于运行时读取）
+/// 2. dlsym DecodeMethodId / DecodeFieldId
+/// 3. 从 ArtRuntimeSpec 获取 JniIdManager* 指针
+/// 4. 如果 decode 函数可用 → 纯读取模式，不修改 ART 状态
+/// 5. 如果 decode 函数不可用但 indirection != kPointer → fallback 强制写 kPointer
+pub(super) fn init_jni_id_decoder() {
+    JNI_ID_DECODER.get_or_init(|| {
+        use super::art_method::{get_jni_ids_indirection_offset, get_art_runtime_spec};
+        use super::PAC_STRIP_MASK;
+
+        // Step 1: 探测 indirection offset
+        let indirection_offset = match get_jni_ids_indirection_offset() {
+            Some(o) => o,
+            None => {
+                output_message("[jniIds] indirection offset 不可用，ID 解码走 fallback 路径");
+                return None;
+            }
+        };
+
+        // Step 2: 获取 Runtime*
+        let runtime = match unsafe { get_runtime_addr() } {
+            Some(r) => r,
+            None => {
+                output_message("[jniIds] 无法获取 Runtime 地址");
+                return None;
+            }
+        };
+
+        let indirection_field_addr = (runtime as usize + indirection_offset) as *const i32;
+
+        // Step 3: dlsym DecodeMethodId / DecodeFieldId (对标 Frida android.js:316-317)
+        let decode_method_fn = unsafe {
+            let sym = crate::jsapi::module::libart_dlsym(
+                "_ZN3art3jni12JniIdManager14DecodeMethodIdEP10_jmethodID"
+            );
+            if !sym.is_null() {
+                Some(std::mem::transmute::<*mut std::ffi::c_void, DecodeIdFn>(sym))
+            } else {
+                None
+            }
+        };
+
+        let decode_field_fn = unsafe {
+            let sym = crate::jsapi::module::libart_dlsym(
+                "_ZN3art3jni12JniIdManager13DecodeFieldIdEP9_jfieldID"
+            );
+            if !sym.is_null() {
+                Some(std::mem::transmute::<*mut std::ffi::c_void, DecodeIdFn>(sym))
+            } else {
+                None
+            }
+        };
+
+        // Step 4: 获取 JniIdManager* (from ArtRuntimeSpec)
+        let jni_id_manager = if decode_method_fn.is_some() || decode_field_fn.is_some() {
+            match get_art_runtime_spec() {
+                Some(spec) => match spec.jni_id_manager_offset {
+                    Some(off) => {
+                        let mgr = unsafe {
+                            super::safe_mem::safe_read_u64(runtime + off as u64) & PAC_STRIP_MASK
+                        };
+                        if mgr != 0 {
+                            output_message(&format!(
+                                "[jniIds] JniIdManager*={:#x} (Runtime+{:#x})", mgr, off
+                            ));
+                        }
+                        mgr
+                    }
+                    None => 0,
+                },
+                None => 0,
+            }
+        } else {
+            0
+        };
+
+        let has_decode = (decode_method_fn.is_some() || decode_field_fn.is_some()) && jni_id_manager != 0;
+
+        // Step 5: 如果 decode 函数可用 → Frida 风格纯读取，不修改 ART 状态
+        // 如果 decode 函数不可用 → fallback 强制写 kPointer
+        let current_mode = unsafe { std::ptr::read_volatile(indirection_field_addr) };
+        let forced_pointer_mode = if has_decode {
+            output_message(&format!(
+                "[jniIds] Frida-style 解码器就绪: DecodeMethodId={}, DecodeFieldId={}, indirection={}",
+                decode_method_fn.is_some(), decode_field_fn.is_some(), current_mode
+            ));
+            false // 不需要强制写
+        } else if current_mode != K_POINTER {
+            // 无 decode 函数但 indirection != kPointer → 必须强制写
+            unsafe { std::ptr::write_volatile(indirection_field_addr as *mut i32, K_POINTER) };
+            output_message(&format!(
+                "[jniIds] decode 函数不可用，fallback 强制 indirection {} → 0 (kPointer), Runtime+{:#x}",
+                current_mode, indirection_offset
+            ));
+            true
+        } else {
+            output_message("[jniIds] 已为 kPointer 模式，jmethodID 即 ArtMethod* 直接可用");
+            false
+        };
+
+        Some(JniIdDecoderState {
+            indirection_field_addr,
+            decode_method_id_fn: decode_method_fn,
+            decode_field_id_fn: decode_field_fn,
+            jni_id_manager,
+            forced_pointer_mode,
+        })
+    });
+}
+
+/// 读取当前 jni_ids_indirection_ 值，判断是否为指针模式
+///
+/// 对标 Frida: 每次读取 Runtime.jni_ids_indirection_，不假设其值不变。
+pub(super) fn is_jni_pointer_mode() -> bool {
+    match JNI_ID_DECODER.get() {
+        Some(Some(state)) => {
+            if state.forced_pointer_mode {
+                return true; // 已强制写为 kPointer
+            }
+            let current = unsafe { std::ptr::read_volatile(state.indirection_field_addr) };
+            current == K_POINTER
+        }
+        _ => false, // 未初始化或初始化失败 → 保守假设需要解码
+    }
+}
+
+/// 通用 JNI ID 解码: 检查 indirection 模式，按需调用 decode 函数。
+///
+/// 对标 Frida unwrapGenericId: 读取 indirection 值，如果不是 kPointer
+/// 则调用对应的 DecodeXxxId(jniIdManager, id)。
+unsafe fn decode_id_via_manager(
+    id: u64,
+    get_fn: impl Fn(&JniIdDecoderState) -> Option<DecodeIdFn>,
+) -> Option<u64> {
+    let state = JNI_ID_DECODER.get()?.as_ref()?;
+
+    if state.forced_pointer_mode {
+        return Some(id);
+    }
+
+    let indirection = std::ptr::read_volatile(state.indirection_field_addr);
+    if indirection == K_POINTER {
+        return Some(id);
+    }
+
+    let decode_fn = get_fn(state)?;
+    if state.jni_id_manager == 0 {
+        return None;
+    }
+
+    let result = decode_fn(
+        state.jni_id_manager as *mut std::ffi::c_void,
+        id as *mut std::ffi::c_void,
+    );
+    if result != 0 { Some(result) } else { None }
+}
+
+/// 通过 JniIdManager::DecodeMethodId 解码 jmethodID → ArtMethod*
+pub(super) unsafe fn decode_method_id_via_manager(method_id: u64) -> Option<u64> {
+    decode_id_via_manager(method_id, |s| s.decode_method_id_fn)
+}
+
+/// 通过 JniIdManager::DecodeFieldId 解码 jfieldID → ArtField*
+pub(super) unsafe fn decode_field_id_via_manager(field_id: u64) -> Option<u64> {
+    decode_id_via_manager(field_id, |s| s.decode_field_id_fn)
+}
+
+/// 解析 /proc/self/mountinfo 提取 ART APEX 版本号
+///
+/// 对标 Frida getArtApexVersion 逻辑:
+/// 遍历每行，第5列 (mountRoot) 以 /apex/com.android.art 开头时:
+/// - 如果 mountRoot 包含 '@'，则 split('@') 取版本部分，记录到 sourceVersions[mountSource]
+/// - 否则记录 artSource = mountSource (第11列)
+/// 最终如果 sourceVersions 包含 artSource，返回对应版本；否则 fallback。
+fn parse_art_apex_version() -> u64 {
+    use std::collections::HashMap;
+
+    let content = match std::fs::read_to_string("/proc/self/mountinfo") {
+        Ok(c) => c,
+        Err(_) => {
+            output_message("[apex] /proc/self/mountinfo 读取失败，使用 fallback");
+            let api = get_android_api_level() as u64;
+            return api * 10_000_000;
+        }
+    };
+
+    let mut source_versions: HashMap<String, u64> = HashMap::new();
+    let mut art_source: Option<String> = None;
+
+    for line in content.lines() {
+        let elements: Vec<&str> = line.split(' ').collect();
+        if elements.len() < 11 {
+            continue;
+        }
+
+        let mount_root = elements[4]; // 第5列 (0-indexed)
+        if !mount_root.starts_with("/apex/com.android.art") {
+            continue;
+        }
+
+        let mount_source = elements[10]; // 第11列
+
+        if mount_root.contains('@') {
+            // 格式: /apex/com.android.art@341715org — '@' 后面是版本号
+            if let Some(version_str) = mount_root.split('@').nth(1) {
+                // 提取纯数字前缀作为版本号
+                let version_digits: String = version_str.chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(version) = version_digits.parse::<u64>() {
+                    source_versions.insert(mount_source.to_string(), version);
+                }
+            }
+        } else {
+            art_source = Some(mount_source.to_string());
+        }
+    }
+
+    // 如果找到 artSource 且 sourceVersions 中有对应版本，返回它
+    if let Some(ref src) = art_source {
+        if let Some(&version) = source_versions.get(src) {
+            return version;
+        }
+    }
+
+    // Fallback: api_level * 10_000_000
+    let api = get_android_api_level() as u64;
+    api * 10_000_000
 }

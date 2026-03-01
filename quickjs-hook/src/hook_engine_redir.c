@@ -21,7 +21,7 @@ static void* generate_redirect_thunk(void* original_entry,
     Arm64Writer w;
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
 
-    uint64_t stack_size = 288;
+    uint64_t stack_size = 352;
 
     /* Save HookContext (no trampoline for redirect mode) */
     emit_save_hook_context(&w, (uint64_t)original_entry, 0);
@@ -194,7 +194,7 @@ static void* generate_native_hook_thunk(HookCallback on_enter,
     Arm64Writer w;
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
 
-    uint64_t stack_size = 288;
+    uint64_t stack_size = 352;
 
     /* Save HookContext (pc=0: not meaningful for native hooks, no trampoline) */
     emit_save_hook_context(&w, 0, 0);

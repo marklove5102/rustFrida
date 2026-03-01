@@ -88,13 +88,13 @@ pub fn init() -> Result<(), String> {
     // Initialize hook engine
     init_hook_engine(exec_mem.as_ptr(), exec_mem.size())?;
 
-    // 初始化 JS 引擎（complete_script 依赖它）
-    get_or_init_engine()?;
-
-    // Set up console callback to send output to socket
+    // 先设置 console callback，确保引擎初始化期间的日志（如 [jniIds]）能通过 socket 输出
     set_console_callback(|msg| {
         write_stream(format!("[JS] {}\n", msg).as_bytes());
     });
+
+    // 初始化 JS 引擎（complete_script 依赖它）
+    get_or_init_engine()?;
 
     ENGINE_INITIALIZED.store(true, Ordering::SeqCst);
 

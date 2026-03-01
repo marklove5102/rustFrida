@@ -2,8 +2,8 @@
 
 use crate::context::JSContext;
 use crate::ffi;
+use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
-use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Class ID for NativePointer — global (not thread_local) so hook callbacks on
@@ -295,37 +295,23 @@ pub fn register_ptr(ctx: &JSContext) {
 
     let global = ctx.global_object();
 
-    // Register ptr() function
     unsafe {
-        let cname = CString::new("ptr").unwrap();
-        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_ptr), cname.as_ptr(), 1);
-        global.set_property(ctx.as_ptr(), "ptr", JSValue(func_val));
-    }
+        let ctx_ptr = ctx.as_ptr();
 
-    // Create NativePointer prototype with methods
-    unsafe {
-        let proto = ffi::JS_NewObject(ctx.as_ptr());
+        // Register ptr() function
+        add_cfunction_to_object(ctx_ptr, global.raw(), "ptr", js_ptr, 1);
 
-        // Add methods to prototype
-        macro_rules! add_method {
-            ($name:expr, $func:expr, $argc:expr) => {
-                let cname = CString::new($name).unwrap();
-                let func_val =
-                    ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), $argc);
-                let atom = ffi::JS_NewAtom(ctx.as_ptr(), cname.as_ptr());
-                ffi::qjs_set_property(ctx.as_ptr(), proto, atom, func_val);
-                ffi::JS_FreeAtom(ctx.as_ptr(), atom);
-            };
-        }
+        // Create NativePointer prototype with methods
+        let proto = ffi::JS_NewObject(ctx_ptr);
 
-        add_method!("add", native_pointer_add, 1);
-        add_method!("sub", native_pointer_sub, 1);
-        add_method!("toString", native_pointer_to_string, 0);
-        add_method!("toNumber", native_pointer_to_number, 0);
-        add_method!("toInt", native_pointer_to_number, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "add", native_pointer_add, 1);
+        add_cfunction_to_object(ctx_ptr, proto, "sub", native_pointer_sub, 1);
+        add_cfunction_to_object(ctx_ptr, proto, "toString", native_pointer_to_string, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "toNumber", native_pointer_to_number, 0);
+        add_cfunction_to_object(ctx_ptr, proto, "toInt", native_pointer_to_number, 0);
 
         // Set as class prototype
-        ffi::JS_SetClassProto(ctx.as_ptr(), class_id, proto);
+        ffi::JS_SetClassProto(ctx_ptr, class_id, proto);
     }
 
     global.free(ctx.as_ptr());

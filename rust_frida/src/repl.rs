@@ -226,6 +226,20 @@ impl Highlighter for JsReplCompleter {
 impl Validator for JsReplCompleter {}
 impl Helper for JsReplCompleter {}
 
+/// 打印 eval 响应：等待 eval_state 结果并格式化输出。
+/// main.rs REPL 循环和 jsrepl 模式共用此逻辑。
+pub(crate) fn print_eval_result(timeout_secs: u64) {
+    match eval_state().recv_timeout(std::time::Duration::from_secs(timeout_secs)) {
+        None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
+        Some(Ok(output)) => {
+            if !output.is_empty() {
+                println!("{GREEN}=> {}{RESET}", output);
+            }
+        }
+        Some(Err(err)) => println!("{RED}[JS error] {}{RESET}", err),
+    }
+}
+
 /// 打印命令帮助表
 pub(crate) fn print_help() {
     use crate::logger::{BOLD, CYAN, DIM, GREEN, RESET, YELLOW};
@@ -330,15 +344,7 @@ pub(crate) fn run_js_repl(sender: &Sender<String>) {
                     break;
                 }
                 // 同步等待 agent 返回结果（最长 5 秒）
-                match eval_state().recv_timeout(std::time::Duration::from_secs(5)) {
-                    None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
-                    Some(Ok(output)) => {
-                        if !output.is_empty() {
-                            println!("{GREEN}=> {}{RESET}", output);
-                        }
-                    }
-                    Some(Err(err)) => println!("{RED}[JS error] {}{RESET}", err),
-                }
+                print_eval_result(5);
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
                 println!("{DIM}退出 JS REPL 模式{RESET}");

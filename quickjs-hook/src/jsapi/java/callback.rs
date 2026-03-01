@@ -177,6 +177,43 @@ pub(super) fn parse_jni_param_types(sig: &str) -> Vec<String> {
 }
 
 // ============================================================================
+// ARM64 JNI calling convention helpers
+// ============================================================================
+
+/// 判断 JNI 类型签名是否表示浮点类型 (float/double)
+#[inline]
+fn is_floating_point_type(sig: Option<&str>) -> bool {
+    matches!(sig, Some(s) if s.starts_with('F') || s.starts_with('D'))
+}
+
+/// 从 HookContext 中按 ARM64 JNI 调用约定提取单个参数值。
+///
+/// ARM64 JNI: GP 寄存器 (x2-x7) 和 FP 寄存器 (d0-d7) 有独立计数器。
+/// 返回 (gp_value, fp_value) — 只有一个有意义。
+#[inline]
+unsafe fn extract_jni_arg(
+    hook_ctx: &hook_ffi::HookContext,
+    is_fp: bool,
+    gp_index: &mut usize,
+    fp_index: &mut usize,
+) -> (u64, u64) {
+    if is_fp {
+        let fp_val = if *fp_index < 8 { hook_ctx.d[*fp_index] } else { 0u64 };
+        *fp_index += 1;
+        (0u64, fp_val)
+    } else {
+        let gp_val = if *gp_index < 6 {
+            hook_ctx.x[2 + *gp_index]
+        } else {
+            let sp = hook_ctx.sp as usize;
+            *((sp + (*gp_index - 6) * 8) as *const u64)
+        };
+        *gp_index += 1;
+        (gp_val, 0u64)
+    }
+}
+
+// ============================================================================
 // callOriginal() — JS CFunction invoked from user's hook callback
 // ============================================================================
 
@@ -232,7 +269,7 @@ unsafe extern "C" fn js_call_original(
     }
 
     // Look up hook data for clone info
-    let (clone_addr, class_global_ref, return_type, param_count, is_static) = {
+    let (clone_addr, class_global_ref, return_type, param_count, is_static, param_types) = {
         let guard = match JAVA_HOOK_REGISTRY.lock() {
             Ok(g) => g,
             Err(e) => e.into_inner(),
@@ -255,7 +292,8 @@ unsafe extern "C" fn js_call_original(
                 );
             }
         };
-        (data.clone_addr, data.class_global_ref, data.return_type, data.param_count, data.is_static)
+        (data.clone_addr, data.class_global_ref, data.return_type, data.param_count, data.is_static,
+         data.param_types.clone())
     }; // lock released
 
     if clone_addr == 0 {
@@ -279,16 +317,14 @@ unsafe extern "C" fn js_call_original(
         e
     };
 
-    // Build jvalue args from HookContext registers (JNI convention: x2-x7 = args[0-5])
+    // Build jvalue args from HookContext registers (ARM64 JNI calling convention).
     let mut jargs: Vec<u64> = Vec::with_capacity(param_count);
+    let mut gp_index: usize = 0;
+    let mut fp_index: usize = 0;
     for i in 0..param_count {
-        let val = if i < 6 {
-            hook_ctx.x[2 + i]
-        } else {
-            let sp = hook_ctx.sp as usize;
-            *((sp + (i - 6) * 8) as *const u64)
-        };
-        jargs.push(val);
+        let type_sig = param_types.get(i).map(|s| s.as_str());
+        let (gp_val, fp_val) = extract_jni_arg(hook_ctx, is_floating_point_type(type_sig), &mut gp_index, &mut fp_index);
+        jargs.push(if is_floating_point_type(type_sig) { fp_val } else { gp_val });
     }
     let jargs_ptr = if param_count > 0 {
         jargs.as_ptr() as *const std::ffi::c_void
@@ -357,10 +393,13 @@ unsafe extern "C" fn js_call_original(
 /// String objects become JS strings (read via GetStringUTFChars).
 /// Other objects become wrapped `{__jptr, __jclass}` for Proxy-based field access.
 /// Falls back to BigUint64 if type info is unavailable.
+///
+/// `fp_raw`: value from the corresponding d-register (for float/double args).
 unsafe fn marshal_jni_arg_to_js(
     ctx: *mut ffi::JSContext,
     env: JniEnv,
     raw: u64,
+    fp_raw: u64,
     type_sig: Option<&str>,
 ) -> ffi::JSValue {
     let sig = match type_sig {
@@ -381,17 +420,15 @@ unsafe fn marshal_jni_arg_to_js(
         b'I' => JSValue::int(raw as i32).raw(),
         b'J' => ffi::JS_NewBigUint64(ctx, raw),
         b'F' => {
-            // KNOWN LIMITATION: ARM64 ABI passes floats in d0-d7 (FP registers), not x registers.
-            // HookContext currently only saves x0-x30. The `raw` value comes from an x register,
-            // which may not contain the float argument. This will produce incorrect values.
-            // TODO: Extend HookContext to save d0-d7 and read float args from FP registers.
-            let f = f32::from_bits(raw as u32);
+            // ARM64 ABI: floats are passed in d0-d7 (FP registers).
+            // fp_raw comes from HookContext.d[fp_index].
+            let f = f32::from_bits(fp_raw as u32);
             JSValue::float(f as f64).raw()
         }
         b'D' => {
-            // KNOWN LIMITATION: Same as F — double args are in d registers, not x registers.
-            // TODO: Extend HookContext to save d0-d7 and read double args from FP registers.
-            let d = f64::from_bits(raw);
+            // ARM64 ABI: doubles are passed in d0-d7 (FP registers).
+            // fp_raw comes from HookContext.d[fp_index].
+            let d = f64::from_bits(fp_raw);
             JSValue::float(d).raw()
         }
         b'L' | b'[' => {
@@ -488,6 +525,16 @@ pub(super) unsafe extern "C" fn java_hook_callback(
     CURRENT_HOOK_CTX_PTR.store(ctx_ptr as usize, Ordering::Relaxed);
     CURRENT_HOOK_ART_METHOD.store(art_method_addr, Ordering::Relaxed);
 
+    // Push local frame to protect JNI local refs from overflowing the table.
+    // Each marshal_jni_arg_to_js call may create local refs (GetStringUTFChars, NewObject, etc.).
+    let hook_ctx_env: JniEnv = (*ctx_ptr).x[0] as JniEnv;
+    let has_local_frame = if !hook_ctx_env.is_null() {
+        let push_frame: PushLocalFrameFn = jni_fn!(hook_ctx_env, PushLocalFrameFn, JNI_PUSH_LOCAL_FRAME);
+        push_frame(hook_ctx_env, (2 + param_count * 2) as i32) == 0
+    } else {
+        false
+    };
+
     invoke_hook_callback_common(
         ctx_usize,
         &callback_bytes,
@@ -505,17 +552,15 @@ pub(super) unsafe extern "C" fn java_hook_callback(
                 JSValue(js_ctx).set_property(ctx, "thisObj", JSValue(val));
             }
 
-            // args[] — x2-x7 = first 6 args, stack for args 6+
+            // args[] — ARM64 JNI calling convention (GP x2-x7, FP d0-d7 independent)
             {
                 let arr = ffi::JS_NewArray(ctx);
+                let mut gp_index: usize = 0;
+                let mut fp_index: usize = 0;
                 for i in 0..param_count {
-                    let raw = if i < 6 {
-                        hook_ctx.x[2 + i]
-                    } else {
-                        let sp = hook_ctx.sp as usize;
-                        *((sp + (i - 6) * 8) as *const u64)
-                    };
-                    let val = marshal_jni_arg_to_js(ctx, env, raw, param_types.get(i).map(|s| s.as_str()));
+                    let type_sig = param_types.get(i).map(|s| s.as_str());
+                    let (raw, fp_raw) = extract_jni_arg(hook_ctx, is_floating_point_type(type_sig), &mut gp_index, &mut fp_index);
+                    let val = marshal_jni_arg_to_js(ctx, env, raw, fp_raw, type_sig);
                     ffi::JS_SetPropertyUint32(ctx, arr, i as u32, val);
                 }
                 JSValue(js_ctx).set_property(ctx, "args", JSValue(arr));
@@ -569,6 +614,12 @@ pub(super) unsafe extern "C" fn java_hook_callback(
             }
         },
     );
+
+    // Pop local frame to release JNI local refs created during callback
+    if has_local_frame && !hook_ctx_env.is_null() {
+        let pop_frame: PopLocalFrameFn = jni_fn!(hook_ctx_env, PopLocalFrameFn, JNI_POP_LOCAL_FRAME);
+        pop_frame(hook_ctx_env, std::ptr::null_mut());
+    }
 
     // Clear callback state globals
     CURRENT_HOOK_CTX_PTR.store(0, Ordering::Relaxed);

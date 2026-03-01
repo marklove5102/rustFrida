@@ -34,7 +34,8 @@ typedef struct {
     uint64_t pc;        /* Program counter (original): 256 */
     uint64_t nzcv;      /* Condition flags: 264 */
     void* trampoline;   /* Trampoline for callOriginal (NULL if N/A): 272 */
-} HookContext;           /* 280 bytes, fits in 288-byte stack alloc */
+    uint64_t d[8];      /* d0-d7 FP registers: 280-343 */
+} HookContext;           /* 344 bytes, fits in 352-byte stack alloc (16-byte aligned) */
 
 /* Callback function types */
 typedef void (*HookCallback)(HookContext* ctx, void* user_data);

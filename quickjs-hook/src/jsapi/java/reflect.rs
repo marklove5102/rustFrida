@@ -17,8 +17,11 @@ use super::jni_core::*;
 /// On Android 11+ (API 30+), jmethodIDs for app classes may be encoded
 /// (bit 0 = 1) rather than raw ArtMethod pointers.
 ///
-/// We decode via JNI: ToReflectedMethod → Method object → artMethod field (long).
-/// This is reliable because it uses public JNI APIs, no private ART symbols needed.
+/// Strategy (对标 Frida unwrapGenericId):
+/// 1. 快速路径: 读取 jni_ids_indirection_ == kPointer → 直接返回
+/// 2. bit 0 == 0 → 原始指针，无需解码
+/// 3. JniIdManager::DecodeMethodId (dlsym 直接调用，不修改 ART 状态)
+/// 4. Fallback: ToReflectedMethod → Method 对象 → artMethod 字段
 ///
 /// Requires `cls` (the jclass the method belongs to) and `is_static` flag.
 pub(super) unsafe fn decode_method_id(
@@ -27,15 +30,34 @@ pub(super) unsafe fn decode_method_id(
     method_id: u64,
     is_static: bool,
 ) -> u64 {
-    if method_id & 1 == 0 {
-        return method_id; // Raw ArtMethod* — no decoding needed
+    // 快速路径: 读取当前 indirection 模式 (对标 Frida: 每次读取而非缓存)
+    if super::jni_core::is_jni_pointer_mode() {
+        return method_id;
     }
 
+    // bit 0 == 0 → raw ArtMethod* 指针，无需解码
+    if method_id & 1 == 0 {
+        return method_id;
+    }
+
+    // Strategy 1: JniIdManager::DecodeMethodId (对标 Frida unwrapGenericId)
+    // 通过 dlsym 获取的 ART 内部函数直接解码，不修改运行时状态
+    if let Some(result) = super::jni_core::decode_method_id_via_manager(method_id) {
+        if result != method_id {
+            output_message(&format!(
+                "[jni] decode_method_id({:#x}): DecodeMethodId → ArtMethod*={:#x}",
+                method_id, result
+            ));
+        }
+        return result;
+    }
+
+    // Strategy 2: Fallback — ToReflectedMethod → artMethod 字段 (long)
     let reflect = match REFLECT_IDS.get() {
         Some(r) if !r.art_method_field_id.is_null() => r,
         _ => {
             output_message(&format!(
-                "[jni] decode_method_id({:#x}): no art_method_field_id cached, returning raw",
+                "[jni] decode_method_id({:#x}): no decoder available, returning raw",
                 method_id
             ));
             return method_id;
@@ -61,10 +83,92 @@ pub(super) unsafe fn decode_method_id(
     delete_local_ref(env, method_obj);
 
     output_message(&format!(
-        "[jni] decode_method_id({:#x}) → artMethod={:#x}", method_id, art_method
+        "[jni] decode_method_id({:#x}) → artMethod={:#x} (via reflection)", method_id, art_method
     ));
 
     art_method
+}
+
+// ============================================================================
+// Encoded jfieldID decoder (Android 11+)
+// ============================================================================
+
+/// Decode a jfieldID to a raw ArtField pointer.
+/// On Android 11+ (API 30+), jfieldIDs may be opaque indices rather than
+/// raw ArtField pointers when `jni_ids_indirection != kPointer`.
+///
+/// Strategy (对标 Frida unwrapGenericId):
+/// 1. 快速路径: 读取 jni_ids_indirection_ == kPointer → 直接返回
+/// 2. bit 0 == 0 → 原始指针，无需解码
+/// 3. JniIdManager::DecodeFieldId (dlsym 直接调用，不修改 ART 状态)
+/// 4. Fallback: ToReflectedField → Field 对象 → artField 字段
+pub(super) unsafe fn decode_field_id(
+    env: JniEnv,
+    cls: *mut std::ffi::c_void,
+    field_id: u64,
+    is_static: bool,
+) -> u64 {
+    // null 检查
+    if field_id == 0 {
+        return 0;
+    }
+
+    // 快速路径: 读取当前 indirection 模式
+    if super::jni_core::is_jni_pointer_mode() {
+        return field_id;
+    }
+
+    // bit 0 == 0 → 原始 ArtField* 指针，无需解码
+    if field_id & 1 == 0 {
+        return field_id;
+    }
+
+    // Strategy 1: JniIdManager::DecodeFieldId (对标 Frida unwrapGenericId)
+    if let Some(result) = super::jni_core::decode_field_id_via_manager(field_id) {
+        if result != field_id {
+            output_message(&format!(
+                "[jni] decode_field_id({:#x}): DecodeFieldId → ArtField*={:#x}",
+                field_id, result
+            ));
+        }
+        return result;
+    }
+
+    // Strategy 2: Fallback — ToReflectedField → artField 字段 (long)
+    let reflect = match REFLECT_IDS.get() {
+        Some(r) if !r.art_field_field_id.is_null() => r,
+        _ => {
+            output_message(&format!(
+                "[jni] decode_field_id({:#x}): no decoder available, returning raw",
+                field_id
+            ));
+            return field_id;
+        }
+    };
+
+    let to_reflected: ToReflectedFieldFn = jni_fn!(env, ToReflectedFieldFn, JNI_TO_REFLECTED_FIELD);
+    let get_long: GetLongFieldFn = jni_fn!(env, GetLongFieldFn, JNI_GET_LONG_FIELD);
+    let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
+
+    let field_obj = to_reflected(
+        env, cls, field_id as *mut std::ffi::c_void,
+        if is_static { 1 } else { 0 },
+    );
+    if field_obj.is_null() || jni_check_exc(env) {
+        output_message(&format!(
+            "[jni] decode_field_id({:#x}): ToReflectedField failed", field_id
+        ));
+        return field_id;
+    }
+
+    let art_field = get_long(env, field_obj, reflect.art_field_field_id) as u64;
+    delete_local_ref(env, field_obj);
+
+    output_message(&format!(
+        "[jni] decode_field_id({:#x}) → artField={:#x} (via reflection)", field_id, art_field
+    ));
+
+    art_field
 }
 
 // ============================================================================
@@ -91,6 +195,8 @@ pub(super) struct ReflectIds {
     pub(super) load_class_mid: *mut std::ffi::c_void,
     /// Field ID for java.lang.reflect.Executable.artMethod (long) — used to decode encoded jmethodIDs
     pub(super) art_method_field_id: *mut std::ffi::c_void,
+    /// Field ID for java.lang.reflect.Field.artField (long) — used to decode encoded jfieldIDs
+    pub(super) art_field_field_id: *mut std::ffi::c_void,
 }
 
 unsafe impl Send for ReflectIds {}
@@ -102,6 +208,11 @@ pub(super) static REFLECT_IDS: std::sync::OnceLock<ReflectIds> = std::sync::Once
 /// because it uses FindClass which triggers ART stack walking.
 pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
     REFLECT_IDS.get_or_init(|| {
+        // 初始化 JNI ID 解码器 (对标 Frida unwrapGenericId)
+        // 优先使用 DecodeMethodId/DecodeFieldId dlsym 直接调用
+        // 仅当 decode 函数不可用时才 fallback 强制写 kPointer
+        super::jni_core::init_jni_id_decoder();
+
         let find_class: FindClassFn = jni_fn!(env, FindClassFn, JNI_FIND_CLASS);
         let get_mid: GetMethodIdFn = jni_fn!(env, GetMethodIdFn, JNI_GET_METHOD_ID);
         let delete_local_ref: DeleteLocalRefFn = jni_fn!(env, DeleteLocalRefFn, JNI_DELETE_LOCAL_REF);
@@ -235,6 +346,27 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
             }
         }
 
+        // --- Cache artField field ID for decoding encoded jfieldIDs (Android 11+) ---
+        let mut art_field_field_id: *mut std::ffi::c_void = std::ptr::null_mut();
+        {
+            let c_field_cls_name = CString::new("java/lang/reflect/Field").unwrap();
+            let field_reflect_cls = find_class(env, c_field_cls_name.as_ptr());
+            if !field_reflect_cls.is_null() && !jni_check_exc(env) {
+                let c_art_field = CString::new("artField").unwrap();
+                let c_j = CString::new("J").unwrap();
+                let fid = get_field_id_fn(env, field_reflect_cls, c_art_field.as_ptr(), c_j.as_ptr());
+                delete_local_ref(env, field_reflect_cls);
+                if !fid.is_null() && !jni_check_exc(env) {
+                    art_field_field_id = fid;
+                    output_message("[java] cached artField field ID from java/lang/reflect/Field");
+                } else {
+                    jni_check_exc(env);
+                }
+            } else {
+                jni_check_exc(env);
+            }
+        }
+
         ReflectIds {
             get_field_mid,
             get_declared_field_mid,
@@ -244,6 +376,7 @@ pub(super) unsafe fn cache_reflect_ids(env: JniEnv) {
             app_classloader,
             load_class_mid,
             art_method_field_id,
+            art_field_field_id,
         }
     });
 }

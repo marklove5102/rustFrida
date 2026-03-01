@@ -61,75 +61,107 @@
         }
     }
 
+    // 获取方法列表（带缓存）
+    function _getMethods(wrapper) {
+        if (wrapper._cache && wrapper._cache.methods) return wrapper._cache.methods;
+        var ms = _methods(wrapper._c);
+        if (wrapper._cache) wrapper._cache.methods = ms;
+        return ms;
+    }
+
+    // 根据参数签名前缀查找匹配的方法
+    function _findOverload(ms, name, paramSig) {
+        for (var i = 0; i < ms.length; i++) {
+            if (ms[i].name === name && ms[i].sig.indexOf(paramSig) === 0) {
+                return ms[i].sig;
+            }
+        }
+        return null;
+    }
+
     // Frida-compatible overload: accepts Java type names as arguments
     // e.g. .overload("java.lang.String", "int") → matches JNI sig "(Ljava/lang/String;I)..."
     // Also accepts raw JNI signature: .overload("(Ljava/lang/String;)I")
+    // Also accepts arrays for multiple overloads: .overload(["int","int"], ["java.lang.String"])
     MethodWrapper.prototype.overload = function() {
+        // Case 1: 数组语法，选择多个overload
+        // .overload(["int", "int"], ["java.lang.String"])
+        if (arguments.length >= 1 && Array.isArray(arguments[0])) {
+            var ms = _getMethods(this);
+            var name = this._m === "$init" ? "<init>" : this._m;
+            var sigs = [];
+            for (var a = 0; a < arguments.length; a++) {
+                var params = arguments[a];
+                var paramSig = "(";
+                for (var i = 0; i < params.length; i++) {
+                    paramSig += _jniType(params[i]);
+                }
+                paramSig += ")";
+                var sig = _findOverload(ms, name, paramSig);
+                if (!sig) {
+                    throw new Error("No matching overload: " + this._c + "." + this._m + paramSig);
+                }
+                sigs.push(sig);
+            }
+            return new MethodWrapper(this._c, this._m, sigs, this._cache);
+        }
+        // Case 2: 原始JNI签名
         if (arguments.length === 1 && typeof arguments[0] === "string"
             && arguments[0].charAt(0) === '(') {
-            // Raw JNI signature passed directly
             return new MethodWrapper(this._c, this._m, arguments[0], this._cache);
         }
-        // Build JNI parameter prefix from Java type names
+        // Case 3: Java类型名（现有行为）
         var paramSig = "(";
         for (var i = 0; i < arguments.length; i++) {
             paramSig += _jniType(arguments[i]);
         }
         paramSig += ")";
-        // Find matching method from _methods
-        var ms;
-        if (this._cache && this._cache.methods) {
-            ms = this._cache.methods;
-        } else {
-            ms = _methods(this._c);
-            if (this._cache) this._cache.methods = ms;
-        }
+        var ms = _getMethods(this);
         var name = this._m === "$init" ? "<init>" : this._m;
-        for (var i = 0; i < ms.length; i++) {
-            if (ms[i].name === name && ms[i].sig.indexOf(paramSig) === 0) {
-                return new MethodWrapper(this._c, this._m, ms[i].sig, this._cache);
-            }
+        var sig = _findOverload(ms, name, paramSig);
+        if (!sig) {
+            throw new Error("No matching overload: " + this._c + "." + this._m + paramSig);
         }
-        throw new Error("No matching overload: " + this._c + "." + this._m + paramSig);
+        return new MethodWrapper(this._c, this._m, sig, this._cache);
     };
 
     Object.defineProperty(MethodWrapper.prototype, "impl", {
         get: function() { return this._fn || null; },
         set: function(fn) {
-            var sig = this._s;
             var name = this._m === "$init" ? "<init>" : this._m;
-            if (!sig) {
-                var ms;
-                if (this._cache && this._cache.methods) {
-                    ms = this._cache.methods;
-                } else {
-                    ms = _methods(this._c);
-                    if (this._cache) this._cache.methods = ms;
-                }
+            var cls = this._c;
+
+            // 确定要hook的签名列表
+            var sigs;
+            if (this._s === null) {
+                // 未指定overload：hook所有overload
+                var ms = _getMethods(this);
                 var match = [];
                 for (var i = 0; i < ms.length; i++) {
                     if (ms[i].name === name) match.push(ms[i]);
                 }
                 if (match.length === 0)
-                    throw new Error("Method not found: " + this._c + "." + this._m);
-                if (match.length > 1) {
-                    var s = match.map(function(m) { return m.sig; }).join(", ");
-                    throw new Error(this._m + " has " + match.length +
-                        " overloads, use .overload(sig): " + s);
-                }
-                sig = match[0].sig;
+                    throw new Error("Method not found: " + cls + "." + this._m);
+                sigs = match.map(function(m) { return m.sig; });
+            } else if (Array.isArray(this._s)) {
+                // 通过数组语法指定的多个overload
+                sigs = this._s;
+            } else {
+                // 单个overload
+                sigs = [this._s];
             }
+
             if (fn === null || fn === undefined) {
-                _unhook(this._c, name, sig);
+                for (var i = 0; i < sigs.length; i++) {
+                    _unhook(cls, name, sigs[i]);
+                }
                 this._fn = null;
             } else {
-                var cls = this._c;
                 var userFn = fn;
-                _hook(this._c, name, sig, function(ctx) {
+                var wrapCallback = function(ctx) {
                     if (ctx.thisObj !== undefined) {
                         ctx.thisObj = _wrapJavaObj(ctx.thisObj, cls);
                     }
-                    // Wrap object args that have __jptr/__jclass as Proxy objects
                     if (ctx.args) {
                         for (var i = 0; i < ctx.args.length; i++) {
                             var a = ctx.args[i];
@@ -140,7 +172,10 @@
                         }
                     }
                     return userFn(ctx);
-                });
+                };
+                for (var i = 0; i < sigs.length; i++) {
+                    _hook(cls, name, sigs[i], wrapCallback);
+                }
                 this._fn = fn;
             }
         }

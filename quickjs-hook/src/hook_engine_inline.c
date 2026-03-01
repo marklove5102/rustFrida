@@ -49,9 +49,9 @@ void* hook_install(void* target, void* replacement, int stealth) {
 /* --- Shared thunk emit helpers --- */
 
 void emit_save_hook_context(Arm64Writer* w, uint64_t target_pc, uint64_t trampoline_ptr) {
-    /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) + trampoline (8) = 280 bytes
-     * Round up to 16-byte alignment: 288 bytes */
-    uint64_t stack_size = 288;
+    /* HookContext: x0-x30 (31*8=248) + sp (8) + pc (8) + nzcv (8) + trampoline (8) + d[8] (64) = 344 bytes
+     * Round up to 16-byte alignment: 352 bytes */
+    uint64_t stack_size = 352;
     arm64_writer_put_sub_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, stack_size);
 
     /* Save x0-x30 to context on stack */
@@ -81,6 +81,11 @@ void emit_save_hook_context(Arm64Writer* w, uint64_t target_pc, uint64_t trampol
         arm64_writer_put_ldr_reg_u64(w, ARM64_REG_X16, trampoline_ptr);
         arm64_writer_put_str_reg_reg_offset(w, ARM64_REG_X16, ARM64_REG_SP, 272); /* trampoline offset */
     }
+
+    /* Save d0-d7 FP registers to context.d[] (offset 280) */
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_stp_offset(w, i, i + 1, ARM64_REG_SP, 280 + i * 8);
+    }
 }
 
 void emit_callback_call(Arm64Writer* w, HookCallback callback, void* user_data) {
@@ -100,8 +105,8 @@ void emit_replace_epilogue(Arm64Writer* w) {
     /* Restore x30 (LR — return to the caller of the hooked function) */
     arm64_writer_put_ldr_reg_reg_offset(w, ARM64_REG_X30, ARM64_REG_SP, 240);
 
-    /* Deallocate stack (288 bytes) */
-    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 288);
+    /* Deallocate stack (352 bytes) */
+    arm64_writer_put_add_reg_reg_imm(w, ARM64_REG_SP, ARM64_REG_SP, 352);
 
     /* Return to caller */
     arm64_writer_put_ret(w);
@@ -118,6 +123,11 @@ void emit_restore_caller_regs(Arm64Writer* w) {
     for (int i = 0; i < 16; i += 2) {
         arm64_writer_put_ldp_reg_reg_reg_offset(w, ARM64_REG_X0 + i, ARM64_REG_X0 + i + 1,
                                                  ARM64_REG_SP, i * 8, ARM64_INDEX_SIGNED_OFFSET);
+    }
+
+    /* Restore d0-d7 FP registers from context.d[] (offset 280) */
+    for (int i = 0; i < 8; i += 2) {
+        arm64_writer_put_fp_ldp_offset(w, i, i + 1, ARM64_REG_SP, 280 + i * 8);
     }
 }
 
@@ -142,7 +152,7 @@ void* generate_attach_thunk(HookEntry* entry, HookCallback on_enter,
     Arm64Writer w;
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
 
-    uint64_t stack_size = 288;
+    uint64_t stack_size = 352;
 
     /* Save HookContext (no trampoline for attach mode) */
     emit_save_hook_context(&w, (uint64_t)entry->target, 0);
@@ -278,7 +288,7 @@ static void* generate_replace_thunk(HookEntry* entry, HookCallback on_enter,
     Arm64Writer w;
     arm64_writer_init(&w, thunk_mem, (uint64_t)thunk_mem, THUNK_ALLOC_SIZE);
 
-    uint64_t stack_size = 288;
+    uint64_t stack_size = 352;
 
     /* Save HookContext with trampoline address */
     emit_save_hook_context(&w, (uint64_t)entry->target, (uint64_t)entry->trampoline);

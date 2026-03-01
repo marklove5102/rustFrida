@@ -9,7 +9,6 @@ use frida_gum::stalker::{Event, EventMask, EventSink, Stalker, Transformer};
 use frida_gum::{Gum, ModuleMap, NativePointer, Process};
 use lazy_static::lazy_static;
 use prost::Message;
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::fs::OpenOptions;
@@ -69,20 +68,9 @@ struct InstrMessage {
     ctx: Vec<RegChange>,
 }
 
-// 全局 Stalker 包装器
-struct StalkerCell(UnsafeCell<Stalker>);
-unsafe impl Sync for StalkerCell {}
-unsafe impl Send for StalkerCell {}
-
-// 全局 ModuleMap 包装器
-struct ModuleMapCell(UnsafeCell<ModuleMap>);
-unsafe impl Sync for ModuleMapCell {}
-unsafe impl Send for ModuleMapCell {}
-
-// 全局 Interceptor 包装器
-struct InterceptorCell(UnsafeCell<Interceptor>);
-unsafe impl Sync for InterceptorCell {}
-unsafe impl Send for InterceptorCell {}
+define_sync_cell!(StalkerCell, Stalker);
+define_sync_cell!(ModuleMapCell, ModuleMap);
+define_sync_cell!(InterceptorCell, Interceptor);
 
 static GLOBAL_STALKER: OnceLock<StalkerCell> = OnceLock::new();
 static GLOBAL_MODULE_MAP: OnceLock<ModuleMapCell> = OnceLock::new();

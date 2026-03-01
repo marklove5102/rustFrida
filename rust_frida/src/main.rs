@@ -15,9 +15,9 @@ use communication::{
     AGENT_STAT, GLOBAL_SENDER,
 };
 use injection::{create_memfd_with_data, inject_to_process, watch_and_inject, AGENT_SO};
-use crate::logger::{DIM, GREEN, RED, RESET, YELLOW};
+use crate::logger::{DIM, RESET};
 use libc::close;
-use repl::{print_help, run_js_repl, CommandCompleter};
+use repl::{print_eval_result, print_help, run_js_repl, CommandCompleter};
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
 use std::sync::atomic::Ordering;
@@ -185,18 +185,7 @@ fn main() {
                                 log_error!("发送 loadjs 失败: {}", e);
                             } else {
                                 // 等待脚本执行结果
-                                match eval_state().recv_timeout(std::time::Duration::from_secs(30))
-                                {
-                                    None => log_warn!("等待脚本执行结果超时"),
-                                    Some(Ok(output)) => {
-                                        if !output.is_empty() {
-                                            println!("{GREEN}=> {}{RESET}", output);
-                                        }
-                                    }
-                                    Some(Err(err)) => {
-                                        println!("{RED}[JS error] {}{RESET}", err)
-                                    }
-                                }
+                                print_eval_result(30);
                             }
                         }
                     }
@@ -280,15 +269,7 @@ fn main() {
                     }
                 }
                 if is_eval_cmd {
-                    match eval_state().recv_timeout(std::time::Duration::from_secs(5)) {
-                        None => println!("{YELLOW}[timeout] 等待执行结果超时{RESET}"),
-                        Some(Ok(output)) => {
-                            if !output.is_empty() {
-                                println!("{GREEN}=> {}{RESET}", output);
-                            }
-                        }
-                        Some(Err(err)) => println!("{RED}[JS error] {}{RESET}", err),
-                    }
+                    print_eval_result(5);
                 }
             }
             Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {

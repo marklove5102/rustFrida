@@ -18,6 +18,19 @@ use crate::{log_agent, log_error, log_success, log_verbose};
 pub(crate) static AGENT_MEMFD: AtomicI32 = AtomicI32::new(-1);
 pub(crate) static STOP_LISTENER: AtomicBool = AtomicBool::new(false);
 
+/// 构造抽象 Unix socket 地址（sun_path[0]=0 + name）。
+/// 返回 (sockaddr_un, addr_len)。
+unsafe fn build_abstract_addr(name: &str) -> (sockaddr_un, u32) {
+    let name_bytes = name.as_bytes();
+    let path_len = name_bytes.len().min(107); // sun_path 最多 108 字节
+    let mut addr: sockaddr_un = zeroed();
+    addr.sun_family = AF_UNIX as u16;
+    addr.sun_path[0] = 0; // abstract namespace
+    addr.sun_path[1..=path_len].copy_from_slice(&name_bytes[..path_len]);
+    let addr_len = (size_of_val(&addr.sun_family) + 1 + path_len) as u32;
+    (addr, addr_len)
+}
+
 /// 泛型同步通道：在多线程间传递单次值，支持超时等待。
 pub(crate) struct SyncChannel<T> {
     mutex: Mutex<Option<T>>,
@@ -32,28 +45,24 @@ impl<T: Clone> SyncChannel<T> {
         }
     }
 
+    /// 获取 mutex 锁，中毒时自动恢复。
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, Option<T>> {
+        self.mutex.lock().unwrap_or_else(|e| {
+            log_error!("SyncChannel: mutex poisoned, recovering");
+            e.into_inner()
+        })
+    }
+
     /// 设置值并通知所有等待者（由 handle_socket_connection 调用）。
     pub(crate) fn send(&self, val: T) {
-        let mut guard = match self.mutex.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log_error!("SyncChannel::send: mutex poisoned, recovering");
-                e.into_inner()
-            }
-        };
+        let mut guard = self.lock_or_recover();
         *guard = Some(val);
         self.cvar.notify_all();
     }
 
     /// 清除当前值。
     pub(crate) fn clear(&self) {
-        let mut guard = match self.mutex.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                log_error!("SyncChannel::clear: mutex poisoned, recovering");
-                e.into_inner()
-            }
-        };
+        let mut guard = self.lock_or_recover();
         *guard = None;
     }
 
@@ -124,20 +133,13 @@ pub(crate) static AGENT_DISCONNECTED: AtomicBool = AtomicBool::new(false);
 /// 检查指定抽象 socket 是否已有监听者（表示另一个 rustfrida 实例正在运行）。
 /// 在 start_socket_listener 之前调用，连接成功则说明已有 agent 会话。
 pub(crate) fn check_agent_running(socket_name: &str) -> bool {
-    use libc::{c_char, connect, socket, AF_UNIX, SOCK_STREAM};
+    use libc::connect;
     unsafe {
         let fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if fd < 0 {
             return false;
         }
-        let name = socket_name.as_bytes();
-        let mut addr: sockaddr_un = zeroed();
-        addr.sun_family = AF_UNIX as u16;
-        addr.sun_path[0] = 0; // abstract namespace
-        for (i, &b) in name.iter().enumerate() {
-            addr.sun_path[i + 1] = b as c_char;
-        }
-        let addr_len = (size_of_val(&addr.sun_family) + 1 + name.len()) as u32;
+        let (addr, addr_len) = build_abstract_addr(socket_name);
         let ret = connect(fd, &addr as *const _ as *const _, addr_len);
         libc::close(fd);
         ret == 0
@@ -263,14 +265,8 @@ pub(crate) fn start_socket_listener(
         return Err(Box::new(std::io::Error::last_os_error()));
     }
 
-    // 构造 sockaddr_un，抽象socket: sun_path[0]=0, 后面跟名字
-    let mut addr: sockaddr_un = unsafe { zeroed() };
-    addr.sun_family = AF_UNIX as u16;
-    let name_bytes = socket_path.as_bytes();
-    let path_len = name_bytes.len().min(107); // sun_path最多108字节
-    addr.sun_path[0] = 0; // 抽象socket
-    addr.sun_path[1..=path_len].copy_from_slice(&name_bytes[..path_len]);
-    let sockaddr_len = (size_of_val(&addr.sun_family) + 1 + path_len) as u32;
+    // 构造抽象 socket 地址
+    let (addr, sockaddr_len) = unsafe { build_abstract_addr(socket_path) };
 
     // 绑定
     let ret = unsafe { bind(fd, &addr as *const _ as *const _, sockaddr_len) };

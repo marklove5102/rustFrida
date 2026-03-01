@@ -2,8 +2,8 @@
 
 use crate::context::JSContext;
 use crate::ffi;
+use crate::jsapi::util::add_cfunction_to_object;
 use crate::value::JSValue;
-use std::ffi::CString;
 use std::sync::Mutex;
 
 /// Callback type for console output
@@ -116,25 +116,15 @@ pub fn register_console(ctx: &JSContext) {
     let global = ctx.global_object();
     let console = ctx.new_object();
 
-    // Helper macro to add console methods
-    macro_rules! add_method {
-        ($name:expr, $func:expr) => {
-            unsafe {
-                let cname = CString::new($name).unwrap();
-                let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), 0);
-                let prop_name = CString::new($name).unwrap();
-                let atom = ffi::JS_NewAtom(ctx.as_ptr(), prop_name.as_ptr());
-                ffi::qjs_set_property(ctx.as_ptr(), console.raw(), atom, func_val);
-                ffi::JS_FreeAtom(ctx.as_ptr(), atom);
-            }
-        };
+    unsafe {
+        let ctx_ptr = ctx.as_ptr();
+        let obj = console.raw();
+        add_cfunction_to_object(ctx_ptr, obj, "log", console_log, 0);
+        add_cfunction_to_object(ctx_ptr, obj, "warn", console_warn, 0);
+        add_cfunction_to_object(ctx_ptr, obj, "error", console_error, 0);
+        add_cfunction_to_object(ctx_ptr, obj, "info", console_info, 0);
+        add_cfunction_to_object(ctx_ptr, obj, "debug", console_debug, 0);
     }
-
-    add_method!("log", console_log);
-    add_method!("warn", console_warn);
-    add_method!("error", console_error);
-    add_method!("info", console_info);
-    add_method!("debug", console_debug);
 
     // Set console on global object
     global.set_property(ctx.as_ptr(), "console", console);

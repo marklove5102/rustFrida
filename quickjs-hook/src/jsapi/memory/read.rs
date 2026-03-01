@@ -6,133 +6,46 @@ use crate::jsapi::util::is_addr_accessible;
 use crate::value::JSValue;
 use super::helpers::get_addr_from_arg;
 
-/// Memory.readU8(ptr)
-pub(super) unsafe extern "C" fn memory_read_u8(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    if argc < 1 {
-        return ffi::JS_ThrowTypeError(ctx, b"readU8() requires 1 argument\0".as_ptr() as *const _);
-    }
-
-    let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
-        Some(a) => a,
-        None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
+/// 生成标准 Memory.readXXX(ptr) 函数。
+/// 使用 `($ctx, $val) => expr` 语法传递 ctx 和读取值到转换表达式。
+macro_rules! define_memory_read {
+    ($name:ident, $js_name:literal, $rust_type:ty, $size:expr,
+     ($ctx_id:ident, $val_id:ident) => $convert:expr) => {
+        pub(super) unsafe extern "C" fn $name(
+            $ctx_id: *mut ffi::JSContext,
+            _this: ffi::JSValue,
+            argc: i32,
+            argv: *mut ffi::JSValue,
+        ) -> ffi::JSValue {
+            if argc < 1 {
+                return ffi::JS_ThrowTypeError(
+                    $ctx_id,
+                    concat!($js_name, "() requires 1 argument\0").as_ptr() as *const _,
+                );
+            }
+            let addr = match get_addr_from_arg($ctx_id, JSValue(*argv)) {
+                Some(a) => a,
+                None => return ffi::JS_ThrowTypeError($ctx_id, b"Invalid pointer\0".as_ptr() as *const _),
+            };
+            if !is_addr_accessible(addr, $size) {
+                return ffi::JS_ThrowRangeError($ctx_id, b"Invalid memory address\0".as_ptr() as *const _);
+            }
+            let $val_id = std::ptr::read_unaligned(addr as *const $rust_type);
+            $convert
+        }
     };
-
-    if !is_addr_accessible(addr, 1) {
-        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
-    }
-    let val = std::ptr::read(addr as *const u8);
-    JSValue::int(val as i32).raw()
 }
 
-/// Memory.readU16(ptr)
-pub(super) unsafe extern "C" fn memory_read_u16(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    if argc < 1 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"readU16() requires 1 argument\0".as_ptr() as *const _,
-        );
-    }
-
-    let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
-        Some(a) => a,
-        None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
-    };
-
-    if !is_addr_accessible(addr, 2) {
-        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
-    }
-    let val = std::ptr::read_unaligned(addr as *const u16);
-    JSValue::int(val as i32).raw()
-}
-
-/// Memory.readU32(ptr)
-pub(super) unsafe extern "C" fn memory_read_u32(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    if argc < 1 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"readU32() requires 1 argument\0".as_ptr() as *const _,
-        );
-    }
-
-    let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
-        Some(a) => a,
-        None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
-    };
-
-    if !is_addr_accessible(addr, 4) {
-        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
-    }
-    let val = std::ptr::read_unaligned(addr as *const u32);
-    // Use BigInt for values that might overflow i32
-    ffi::JS_NewBigUint64(ctx, val as u64)
-}
-
-/// Memory.readU64(ptr)
-pub(super) unsafe extern "C" fn memory_read_u64(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    if argc < 1 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"readU64() requires 1 argument\0".as_ptr() as *const _,
-        );
-    }
-
-    let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
-        Some(a) => a,
-        None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
-    };
-
-    if !is_addr_accessible(addr, 8) {
-        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
-    }
-    let val = std::ptr::read_unaligned(addr as *const u64);
-    ffi::JS_NewBigUint64(ctx, val)
-}
-
-/// Memory.readPointer(ptr)
-pub(super) unsafe extern "C" fn memory_read_pointer(
-    ctx: *mut ffi::JSContext,
-    _this: ffi::JSValue,
-    argc: i32,
-    argv: *mut ffi::JSValue,
-) -> ffi::JSValue {
-    if argc < 1 {
-        return ffi::JS_ThrowTypeError(
-            ctx,
-            b"readPointer() requires 1 argument\0".as_ptr() as *const _,
-        );
-    }
-
-    let addr = match get_addr_from_arg(ctx, JSValue(*argv)) {
-        Some(a) => a,
-        None => return ffi::JS_ThrowTypeError(ctx, b"Invalid pointer\0".as_ptr() as *const _),
-    };
-
-    if !is_addr_accessible(addr, 8) {
-        return ffi::JS_ThrowRangeError(ctx, b"Invalid memory address\0".as_ptr() as *const _);
-    }
-    let val = std::ptr::read_unaligned(addr as *const u64);
-    create_native_pointer(ctx, val).raw()
-}
+define_memory_read!(memory_read_u8, "readU8", u8, 1,
+    (_ctx, val) => JSValue::int(val as i32).raw());
+define_memory_read!(memory_read_u16, "readU16", u16, 2,
+    (_ctx, val) => JSValue::int(val as i32).raw());
+define_memory_read!(memory_read_u32, "readU32", u32, 4,
+    (ctx, val) => ffi::JS_NewBigUint64(ctx, val as u64));
+define_memory_read!(memory_read_u64, "readU64", u64, 8,
+    (ctx, val) => ffi::JS_NewBigUint64(ctx, val));
+define_memory_read!(memory_read_pointer, "readPointer", u64, 8,
+    (ctx, val) => create_native_pointer(ctx, val).raw());
 
 /// Memory.readCString(ptr)
 pub(super) unsafe extern "C" fn memory_read_cstring(
@@ -236,6 +149,5 @@ pub(super) unsafe extern "C" fn memory_read_byte_array(
     }
     // Create ArrayBuffer
     let slice = std::slice::from_raw_parts(addr as *const u8, length);
-    let arr = ffi::JS_NewArrayBufferCopy(ctx, slice.as_ptr(), length);
-    arr
+    ffi::JS_NewArrayBufferCopy(ctx, slice.as_ptr(), length)
 }

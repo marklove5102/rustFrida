@@ -1,5 +1,32 @@
 //! jsapi 共用工具函数
 
+use crate::ffi;
+use std::ffi::CString;
+
+/// QuickJS CFunction 签名类型
+pub(crate) type JSCFn = unsafe extern "C" fn(
+    ctx: *mut ffi::JSContext,
+    this: ffi::JSValue,
+    argc: i32,
+    argv: *mut ffi::JSValue,
+) -> ffi::JSValue;
+
+/// 将 CFunction 作为属性添加到 JS 对象上。
+/// 各 jsapi 模块注册函数时的通用模式。
+pub(crate) unsafe fn add_cfunction_to_object(
+    ctx: *mut ffi::JSContext,
+    obj: ffi::JSValue,
+    name: &str,
+    func: JSCFn,
+    argc: i32,
+) {
+    let cname = CString::new(name).unwrap();
+    let func_val = ffi::qjs_new_cfunction(ctx, Some(func), cname.as_ptr(), argc);
+    let atom = ffi::JS_NewAtom(ctx, cname.as_ptr());
+    ffi::qjs_set_property(ctx, obj, atom, func_val);
+    ffi::JS_FreeAtom(ctx, atom);
+}
+
 /// Check if [addr, addr+size) is accessible using mincore(2).
 /// Returns false for null/zero or unmapped pages.
 pub(crate) fn is_addr_accessible(addr: u64, size: usize) -> bool {

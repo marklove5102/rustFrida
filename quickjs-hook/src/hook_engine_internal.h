@@ -113,11 +113,11 @@ void finalize_hook(HookEntry* entry, void* thunk, size_t thunk_size);
 /* --- Thunk emit helpers (hook_engine_inline.c) --- */
 
 /*
- * Emit the shared HookContext save prologue (288-byte stack frame).
+ * Emit the shared HookContext save prologue (352-byte stack frame).
  *
- * Generates: SUB SP, #288 → STP x0-x29 → STR x30 →
+ * Generates: SUB SP, #352 → STP x0-x29 → STR x30 →
  *            save original SP → save target_pc → save NZCV →
- *            optionally save trampoline_ptr
+ *            optionally save trampoline_ptr → STP d0-d7
  *
  * @param w               Writer instance
  * @param target_pc       Value to store in context.pc (original function address)
@@ -138,16 +138,16 @@ void emit_save_hook_context(Arm64Writer* w, uint64_t target_pc, uint64_t trampol
 void emit_callback_call(Arm64Writer* w, HookCallback callback, void* user_data);
 
 /*
- * Emit replace-mode epilogue: restore x0 + LR, deallocate 288-byte stack, RET.
+ * Emit replace-mode epilogue: restore x0 + LR, deallocate 352-byte stack, RET.
  *
  * Shared by generate_replace_thunk (inline hook) and generate_native_hook_thunk (Java hook).
  */
 void emit_replace_epilogue(Arm64Writer* w);
 
 /*
- * Emit x0-x15 restore from HookContext on stack.
+ * Emit x0-x15 + d0-d7 restore from HookContext on stack.
  *
- * Restores caller-saved registers (x0-x15) from the 288-byte HookContext frame.
+ * Restores caller-saved registers (x0-x15, d0-d7) from the 352-byte HookContext frame.
  * Does NOT restore x16-x18 — caller handles those after loading addresses into x16.
  *
  * Shared by generate_attach_thunk (inline hook) and generate_redirect_thunk (Java hook).

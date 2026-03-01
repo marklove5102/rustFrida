@@ -7,10 +7,71 @@ use crate::jsapi::console::output_message;
 use crate::jsapi::module::{libart_dlsym, dlsym_first_match, is_in_libart};
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
+use super::PAC_STRIP_MASK;
 use super::jni_core::*;
 use super::reflect::*;
+use super::safe_mem::{refresh_mem_regions, safe_read_u64};
+
+// ============================================================================
+// 共享 Runtime 布局辅助函数
+// ============================================================================
+
+/// 根据 API 级别和 java_vm_ 偏移计算 classLinker_ 在 Runtime 中的候选偏移列表。
+///
+/// 共享于 find_classlinker_trampolines 和 probe_art_runtime_spec。
+/// 对标 Frida android.js:649-662。
+fn compute_classlinker_candidates(java_vm_off: usize) -> Vec<usize> {
+    const STD_STRING_SIZE: usize = 3 * 8;
+    const PTR_SIZE: usize = 8;
+
+    let api_level = get_android_api_level();
+    let codename = get_android_codename();
+    let is_34_equiv = is_api_level_34_or_apex_equivalent();
+
+    if api_level >= 33 || codename == "Tiramisu" || is_34_equiv {
+        vec![java_vm_off - 4 * PTR_SIZE]
+    } else if api_level >= 30 || codename == "R" || codename == "S" {
+        vec![java_vm_off - 3 * PTR_SIZE, java_vm_off - 4 * PTR_SIZE]
+    } else if api_level >= 29 || codename == "Q" {
+        vec![java_vm_off - 2 * PTR_SIZE]
+    } else if api_level >= 27 {
+        vec![java_vm_off - STD_STRING_SIZE - 3 * PTR_SIZE]
+    } else {
+        vec![java_vm_off - STD_STRING_SIZE - 2 * PTR_SIZE]
+    }
+}
+
+// ============================================================================
+// ArtField layout — 按 API level 硬编码 (对标 Frida getArtFieldSpec)
+// ============================================================================
+
+/// ArtField 结构体字段偏移规格
+pub(super) struct ArtFieldSpec {
+    pub size: usize,
+    pub access_flags_offset: usize,
+}
+
+static ART_FIELD_SPEC: OnceLock<Option<ArtFieldSpec>> = OnceLock::new();
+
+/// 获取 ArtField 布局规格（按 API level 硬编码，对标 Frida getArtFieldSpec）
+///
+/// API >= 23 (Android 6+): size=16, access_flags_offset=4
+/// API 21-22 (Android 5.x): size=24, access_flags_offset=12
+/// API < 21: 不支持
+pub(super) fn get_art_field_spec() -> Option<&'static ArtFieldSpec> {
+    ART_FIELD_SPEC.get_or_init(|| {
+        let api_level = get_android_api_level();
+        if api_level >= 23 {
+            Some(ArtFieldSpec { size: 16, access_flags_offset: 4 })
+        } else if api_level >= 21 {
+            Some(ArtFieldSpec { size: 24, access_flags_offset: 12 })
+        } else {
+            None
+        }
+    }).as_ref()
+}
 
 // ============================================================================
 // ART bridge functions — ART internal trampoline addresses
@@ -26,6 +87,8 @@ pub(super) struct ArtBridgeFunctions {
     pub(super) quick_to_interpreter_bridge: u64,
     /// art_quick_resolution_trampoline — 方法解析 trampoline
     pub(super) quick_resolution_trampoline: u64,
+    /// art_quick_imt_conflict_trampoline — 接口方法分发冲突 trampoline
+    pub(super) quick_imt_conflict_trampoline: u64,
     /// Nterp 解释器入口点（Android 12+），0 表示不可用
     pub(super) nterp_entry_point: u64,
     /// art::interpreter::DoCall<> 模板实例地址（最多4个）
@@ -40,6 +103,15 @@ pub(super) struct ArtBridgeFunctions {
     pub(super) get_oat_quick_method_header: u64,
     /// ClassLinker::FixupStaticTrampolines / MakeInitializedClassesVisiblyInitialized 地址，0 表示不可用
     pub(super) fixup_static_trampolines: u64,
+    /// art::Thread::Current() 函数地址，用于递归防护中获取当前线程
+    pub(super) thread_current: u64,
+    /// ArtMethod::PrettyMethod 函数地址，用于 NULL 指针崩溃防护
+    pub(super) pretty_method: u64,
+    /// 从 trampoline 解析出的真实 quick entrypoint（用于 entrypoint 比较）
+    /// trampoline 通常是一条 LDR Xn, [Thread, #offset] 指令，实际入口在 Thread TLS 中
+    pub(super) resolved_jni_entrypoint: u64,
+    pub(super) resolved_interpreter_bridge_entrypoint: u64,
+    pub(super) resolved_resolution_entrypoint: u64,
 }
 
 unsafe impl Send for ArtBridgeFunctions {}
@@ -47,6 +119,52 @@ unsafe impl Sync for ArtBridgeFunctions {}
 
 /// 全局缓存的 ART bridge 函数地址
 pub(super) static ART_BRIDGE_FUNCTIONS: std::sync::OnceLock<ArtBridgeFunctions> = std::sync::OnceLock::new();
+
+/// 从 trampoline 地址解析真实的 quick entrypoint。
+///
+/// ART trampoline 的第一条指令通常是 `LDR Xn, [Xm, #offset]`，
+/// 从 Thread TLS 中加载真实入口点地址。本函数读取该指令，提取 offset，
+/// 然后通过 JNIEnv → Thread* 读取实际入口点。
+///
+/// 如果第一条指令不是 LDR 格式或 trampoline 为 0，则返回 trampoline 本身（fallback）。
+unsafe fn resolve_quick_entrypoint_from_trampoline(trampoline: u64, env: JniEnv) -> u64 {
+    if trampoline == 0 {
+        return 0;
+    }
+
+    // 读取 trampoline 地址处的第一条 ARM64 指令
+    let insn = *(trampoline as *const u32);
+
+    // 检查是否是 LDR Xn, [Xm, #imm] 格式 (unsigned offset)
+    // 编码: 1111 1001 01xx xxxx xxxx xxxx xxxx xxxx
+    // mask: FFC0_0000, expected: F940_0000
+    if (insn & 0xFFC0_0000) != 0xF940_0000 {
+        // 不是 LDR 指令，返回 trampoline 本身
+        return trampoline;
+    }
+
+    // 提取 imm12 (bits [21:10])，单位为 8 字节（64 位 LDR 的 scale）
+    let imm12 = ((insn >> 10) & 0xFFF) as u64;
+    let offset = imm12 * 8;
+
+    // 从 JNIEnv 获取 Thread*: *(env + 8) 即 JNIEnvExt.self_
+    let thread = *((env as usize + 8) as *const u64) & PAC_STRIP_MASK;
+    if thread == 0 {
+        return trampoline;
+    }
+
+    // 读取 *(thread + offset) 作为 resolved entrypoint
+    let resolved = *((thread as usize + offset as usize) as *const u64) & PAC_STRIP_MASK;
+    if resolved != 0 {
+        output_message(&format!(
+            "[art bridge] 解析 trampoline {:#x} → Thread+{:#x} → entrypoint {:#x}",
+            trampoline, offset, resolved
+        ));
+        resolved
+    } else {
+        trampoline
+    }
+}
 
 /// 发现并缓存所有 ART 内部桥接函数地址。
 ///
@@ -59,12 +177,12 @@ pub(super) unsafe fn find_art_bridge_functions(env: JniEnv, _ep_offset: usize) -
     ART_BRIDGE_FUNCTIONS.get_or_init(|| {
         output_message("[art bridge] 开始发现 ART 内部桥接函数...");
 
-        // --- ClassLinker 扫描: 一次提取 3 个 trampoline ---
-        let (jni_tramp, interp_bridge, resolution_tramp) = find_classlinker_trampolines(env);
+        // --- ClassLinker 扫描: 一次提取 4 个 trampoline ---
+        let (jni_tramp, interp_bridge, resolution_tramp, imt_conflict) = find_classlinker_trampolines(env);
 
         output_message(&format!(
-            "[art bridge] ClassLinker 结果: jni_tramp={:#x}, interp_bridge={:#x}, resolution_tramp={:#x}",
-            jni_tramp, interp_bridge, resolution_tramp
+            "[art bridge] ClassLinker 结果: jni_tramp={:#x}, interp_bridge={:#x}, resolution_tramp={:#x}, imt_conflict={:#x}",
+            jni_tramp, interp_bridge, resolution_tramp, imt_conflict
         ));
 
         // --- dlsym: Nterp 入口点 ---
@@ -98,12 +216,31 @@ pub(super) unsafe fn find_art_bridge_functions(env: JniEnv, _ep_offset: usize) -
         let fixup_static = find_fixup_static_trampolines();
         output_message(&format!("[art bridge] fixup_static_trampolines={:#x}", fixup_static));
 
+        // --- dlsym: Thread::Current() (递归防护用) ---
+        let thread_current = find_thread_current();
+        output_message(&format!("[art bridge] thread_current={:#x}", thread_current));
+
+        // --- dlsym: ArtMethod::PrettyMethod (NULL 指针崩溃防护) ---
+        let pretty_method = find_pretty_method();
+        output_message(&format!("[art bridge] pretty_method={:#x}", pretty_method));
+
+        // --- 解析 trampoline → 真实 quick entrypoint ---
+        let resolved_jni = resolve_quick_entrypoint_from_trampoline(jni_tramp, env);
+        let resolved_interp = resolve_quick_entrypoint_from_trampoline(interp_bridge, env);
+        let resolved_resolution = resolve_quick_entrypoint_from_trampoline(resolution_tramp, env);
+
+        output_message(&format!(
+            "[art bridge] resolved entrypoints: jni={:#x}, interp={:#x}, resolution={:#x}",
+            resolved_jni, resolved_interp, resolved_resolution
+        ));
+
         output_message("[art bridge] ART 桥接函数发现完成");
 
         ArtBridgeFunctions {
             quick_generic_jni_trampoline: jni_tramp,
             quick_to_interpreter_bridge: interp_bridge,
             quick_resolution_trampoline: resolution_tramp,
+            quick_imt_conflict_trampoline: imt_conflict,
             nterp_entry_point: nterp,
             do_call_addrs: do_calls,
             gc_copying_phase: gc_phase,
@@ -111,6 +248,11 @@ pub(super) unsafe fn find_art_bridge_functions(env: JniEnv, _ep_offset: usize) -
             run_flip_function: run_flip,
             get_oat_quick_method_header: get_oat_header,
             fixup_static_trampolines: fixup_static,
+            thread_current,
+            pretty_method,
+            resolved_jni_entrypoint: resolved_jni,
+            resolved_interpreter_bridge_entrypoint: resolved_interp,
+            resolved_resolution_entrypoint: resolved_resolution,
         }
     })
 }
@@ -125,21 +267,24 @@ pub(super) unsafe fn find_art_bridge_functions(env: JniEnv, _ep_offset: usize) -
 ///   quick_generic_jni_trampoline_           +(delta)*8
 ///   quick_to_interpreter_bridge_trampoline_ +(delta+1)*8
 ///
-/// 返回 (quick_generic_jni_trampoline, quick_to_interpreter_bridge, quick_resolution_trampoline)
-unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64) {
+/// 返回 (quick_generic_jni_trampoline, quick_to_interpreter_bridge, quick_resolution_trampoline, quick_imt_conflict_trampoline)
+unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64, u64) {
     // --- Strategy 1: dlsym (可能在某些 Android 构建中可用) ---
     // 注意: art_quick_* 符号通常是 LOCAL HIDDEN，dlsym 一般找不到
     let sym_jni = CString::new("art_quick_generic_jni_trampoline").unwrap();
     let sym_interp = CString::new("art_quick_to_interpreter_bridge").unwrap();
     let sym_resolution = CString::new("art_quick_resolution_trampoline").unwrap();
 
+    let sym_imt = CString::new("art_quick_imt_conflict_trampoline").unwrap();
+
     let jni_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_jni.as_ptr());
     let interp_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_interp.as_ptr());
     let resolution_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_resolution.as_ptr());
+    let imt_sym = libc::dlsym(libc::RTLD_DEFAULT, sym_imt.as_ptr());
 
     if !jni_sym.is_null() && !interp_sym.is_null() && !resolution_sym.is_null() {
         output_message("[art bridge] 全部通过 dlsym 发现");
-        return (jni_sym as u64, interp_sym as u64, resolution_sym as u64);
+        return (jni_sym as u64, interp_sym as u64, resolution_sym as u64, imt_sym as u64);
     }
 
     // --- Strategy 2: ClassLinker 扫描 (主要策略) ---
@@ -147,81 +292,34 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64) {
     // 必须通过 ClassLinker 结构体内存扫描获取
     output_message("[art bridge] dlsym 未能获取全部地址，尝试 ClassLinker 扫描...");
 
-    let vm_ptr = {
-        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(state) => state.vm,
-            None => {
-                output_message("[art bridge] ClassLinker 扫描: 无 JavaVM 缓存");
-                return (jni_sym as u64, interp_sym as u64, resolution_sym as u64);
-            }
+    let (runtime, java_vm_off) = match find_runtime_java_vm() {
+        Some(v) => v,
+        None => {
+            output_message("[art bridge] ClassLinker 扫描: 无法获取 Runtime/java_vm_ 偏移");
+            return (jni_sym as u64, interp_sym as u64, resolution_sym as u64, imt_sym as u64);
         }
     };
-
-    // JavaVMExt.runtime_ 在 offset 8（vtable 指针之后）
-    let runtime_raw = *((vm_ptr as usize + 8) as *const u64);
-    let runtime = runtime_raw & 0x00FF_FFFF_FFFF_FFFF;
-    if runtime == 0 {
-        output_message(&format!(
-            "[art bridge] ClassLinker 扫描: runtime 指针为空 (raw={:#x})", runtime_raw
-        ));
-        return (jni_sym as u64, interp_sym as u64, resolution_sym as u64);
-    }
 
     output_message(&format!(
-        "[art bridge] JavaVM={:#x}, Runtime={:#x}", vm_ptr as u64, runtime
+        "[art bridge] Runtime={:#x}, java_vm_ 在 Runtime+{:#x}", runtime, java_vm_off
     ));
 
-    // 扫描 Runtime 查找 java_vm_ 字段
-    let vm_addr_stripped = (vm_ptr as u64) & 0x00FF_FFFF_FFFF_FFFF;
-    let scan_start = 384usize;
-    let scan_end = scan_start + 800;
-
-    let mut java_vm_offset: Option<usize> = None;
-    for offset in (scan_start..scan_end).step_by(8) {
-        let val = *((runtime as usize + offset) as *const u64);
-        let val_stripped = val & 0x00FF_FFFF_FFFF_FFFF;
-        if val_stripped == vm_addr_stripped {
-            java_vm_offset = Some(offset);
-            output_message(&format!(
-                "[art bridge] 找到 java_vm_ 在 Runtime+{:#x}", offset
-            ));
-            break;
-        }
-    }
-
-    let java_vm_off = match java_vm_offset {
-        Some(o) => o,
-        None => {
-            output_message("[art bridge] ClassLinker 扫描: Runtime 中未找到 java_vm_");
-            return (jni_sym as u64, interp_sym as u64, resolution_sym as u64);
-        }
-    };
-
     let api_level = get_android_api_level();
-    output_message(&format!("[art bridge] Android API 级别: {}", api_level));
+    let codename = get_android_codename();
+    output_message(&format!("[art bridge] Android API level: {}, codename: '{}'", api_level, codename));
 
-    // 根据 API 级别确定 classLinker_ 在 Runtime 中的候选偏移
-    let class_linker_candidates: Vec<usize> = if api_level >= 33 {
-        vec![java_vm_off - 4 * 8]
-    } else if api_level >= 30 {
-        vec![java_vm_off - 3 * 8, java_vm_off - 4 * 8]
-    } else if api_level >= 29 {
-        vec![java_vm_off - 2 * 8]
-    } else {
-        vec![java_vm_off - 3 * 8 - 3 * 8]
-    };
+    let class_linker_candidates = compute_classlinker_candidates(java_vm_off);
+
+    // find_runtime_java_vm 已经调用了 refresh_mem_regions()
 
     for &cl_off in &class_linker_candidates {
-        let class_linker_raw = *((runtime as usize + cl_off) as *const u64);
-        let class_linker = class_linker_raw & 0x00FF_FFFF_FFFF_FFFF;
+        let class_linker = safe_read_u64(runtime + cl_off as u64) & PAC_STRIP_MASK;
         if class_linker == 0 {
             continue;
         }
 
         let intern_table_off = cl_off - 8;
-        let intern_table_raw = *((runtime as usize + intern_table_off) as *const u64);
-        let intern_table = intern_table_raw & 0x00FF_FFFF_FFFF_FFFF;
+        let intern_table = safe_read_u64(runtime + intern_table_off as u64) & PAC_STRIP_MASK;
         if intern_table == 0 {
             continue;
         }
@@ -237,8 +335,8 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64) {
 
         let mut intern_table_cl_offset: Option<usize> = None;
         for offset in (cl_scan_start..cl_scan_end).step_by(8) {
-            let val = *((class_linker as usize + offset) as *const u64);
-            let val_stripped = val & 0x00FF_FFFF_FFFF_FFFF;
+            let val = safe_read_u64(class_linker + offset as u64);
+            let val_stripped = val & PAC_STRIP_MASK;
             if val_stripped == intern_table {
                 intern_table_cl_offset = Some(offset);
                 output_message(&format!(
@@ -256,33 +354,39 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64) {
             }
         };
 
-        // 根据 API 级别计算 delta
-        let delta: usize = if api_level >= 30 {
+        // 根据 API 级别计算 delta (intern_table_ 到 quick_generic_jni_trampoline_ 的字段数)
+        let delta: usize = if api_level >= 30 || codename == "R" {
             6
         } else if api_level >= 29 {
             4
-        } else {
+        } else if api_level >= 23 {
             3
+        } else {
+            5 // Android 5.x: portable_resolution/imt_conflict/to_interpreter trampolines
         };
 
-        // 提取三个 trampoline 地址
+        // 提取四个 trampoline 地址
         let jni_tramp_off = it_off + delta * 8;
         let interp_bridge_off = jni_tramp_off + 8;
-        // resolution trampoline 在 intern_table_ 之后第一个位置
-        let resolution_tramp_off = it_off + 1 * 8;
+        // imt_conflict trampoline: genericJni 前一个指针位置
+        let imt_conflict_off = jni_tramp_off - 8;
+        // resolution trampoline: 从 jni_tramp 反推（API 29+ 有额外字段，不再紧跟 intern_table）
+        // API >= 23: resolution 在 jni_tramp 前 2 个位置
+        // API < 23: resolution 在 jni_tramp 前 3 个位置（有 portable_resolution_trampoline_）
+        let resolution_tramp_off = if api_level >= 23 {
+            jni_tramp_off - 2 * 8
+        } else {
+            jni_tramp_off - 3 * 8
+        };
 
-        let jni_tramp_addr = *((class_linker as usize + jni_tramp_off) as *const u64);
-        let jni_tramp = jni_tramp_addr & 0x0000_FFFF_FFFF_FFFF; // strip PAC
-
-        let interp_bridge_addr = *((class_linker as usize + interp_bridge_off) as *const u64);
-        let interp_bridge = interp_bridge_addr & 0x0000_FFFF_FFFF_FFFF;
-
-        let resolution_tramp_addr = *((class_linker as usize + resolution_tramp_off) as *const u64);
-        let resolution_tramp = resolution_tramp_addr & 0x0000_FFFF_FFFF_FFFF;
+        let jni_tramp = safe_read_u64(class_linker + jni_tramp_off as u64) & PAC_STRIP_MASK;
+        let interp_bridge = safe_read_u64(class_linker + interp_bridge_off as u64) & PAC_STRIP_MASK;
+        let resolution_tramp = safe_read_u64(class_linker + resolution_tramp_off as u64) & PAC_STRIP_MASK;
+        let imt_conflict = safe_read_u64(class_linker + imt_conflict_off as u64) & PAC_STRIP_MASK;
 
         output_message(&format!(
-            "[art bridge] ClassLinker: jni_tramp=ClassLinker+{:#x}={:#x}, interp=ClassLinker+{:#x}={:#x}, resolution=ClassLinker+{:#x}={:#x}",
-            jni_tramp_off, jni_tramp, interp_bridge_off, interp_bridge, resolution_tramp_off, resolution_tramp
+            "[art bridge] ClassLinker: jni_tramp=ClassLinker+{:#x}={:#x}, interp=ClassLinker+{:#x}={:#x}, resolution=ClassLinker+{:#x}={:#x}, imt_conflict=ClassLinker+{:#x}={:#x}",
+            jni_tramp_off, jni_tramp, interp_bridge_off, interp_bridge, resolution_tramp_off, resolution_tramp, imt_conflict_off, imt_conflict
         ));
 
         // 验证: 应为 libart.so 中的代码指针
@@ -303,13 +407,20 @@ unsafe fn find_classlinker_trampolines(_env: JniEnv) -> (u64, u64, u64) {
             } else {
                 0
             };
+            let final_imt = if imt_conflict != 0 && is_code_pointer(imt_conflict) {
+                imt_conflict
+            } else if !imt_sym.is_null() {
+                imt_sym as u64
+            } else {
+                0
+            };
 
-            return (final_jni, final_interp, final_resolution);
+            return (final_jni, final_interp, final_resolution, final_imt);
         }
     }
 
     output_message("[art bridge] ClassLinker 扫描失败，返回 dlsym 结果（部分可能为0）");
-    (jni_sym as u64, interp_sym as u64, resolution_sym as u64)
+    (jni_sym as u64, interp_sym as u64, resolution_sym as u64, imt_sym as u64)
 }
 
 /// 查找 Nterp 解释器入口点（Android 12+ / API 31+）
@@ -416,24 +527,13 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
     }
 
     // 从 JavaVM → Runtime → jit_code_cache_ 导航获取 JitCodeCache*
-    let vm_ptr = {
-        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.as_ref() {
-            Some(state) => state.vm,
-            None => {
-                output_message("[jit cache] 无 JavaVM 缓存，跳过 JIT 缓存清空");
-                return;
-            }
+    let runtime = match get_runtime_addr() {
+        Some(r) => r,
+        None => {
+            output_message("[jit cache] 无法获取 Runtime 地址，跳过 JIT 缓存清空");
+            return;
         }
     };
-
-    // JavaVMExt.runtime_ 在 offset 8 (vtable 之后)
-    let runtime_raw = *((vm_ptr as usize + 8) as *const u64);
-    let runtime = runtime_raw & 0x00FF_FFFF_FFFF_FFFF;
-    if runtime == 0 {
-        output_message("[jit cache] Runtime 指针为空，跳过 JIT 缓存清空");
-        return;
-    }
 
     // 从 Runtime 获取 jit_code_cache_:
     // 尝试 dlsym Runtime::instance_ 获取更可靠的路径
@@ -442,7 +542,7 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
 
     let runtime_addr = if !instance_ptr.is_null() {
         let rt = *(instance_ptr as *const u64);
-        let rt_stripped = rt & 0x00FF_FFFF_FFFF_FFFF;
+        let rt_stripped = rt & PAC_STRIP_MASK;
         if rt_stripped != 0 { rt_stripped } else { runtime }
     } else {
         runtime
@@ -471,12 +571,13 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
         // 需要 Jit* this — 从 Runtime 获取
         // Runtime::jit_ 指针扫描
         // jit_ 通常在 Runtime 中较后的位置 (offset 600-900)
+        refresh_mem_regions();
         let scan_start = 500usize;
         let scan_end = 1200usize;
 
         for offset in (scan_start..scan_end).step_by(8) {
-            let candidate = *((runtime_addr as usize + offset) as *const u64);
-            let candidate_stripped = candidate & 0x00FF_FFFF_FFFF_FFFF;
+            let candidate = safe_read_u64(runtime_addr + offset as u64);
+            let candidate_stripped = candidate & PAC_STRIP_MASK;
 
             // 跳过空指针和非堆地址
             if candidate_stripped == 0 || candidate_stripped < 0x7000_0000 {
@@ -490,13 +591,13 @@ pub(super) unsafe fn try_invalidate_jit_cache() {
 
             // 安全检查: 确保 candidate 看起来像合理的对象指针
             // 读取前 8 字节看是否为合理值
-            let first_word = *((candidate_stripped as usize) as *const u64);
+            let first_word = safe_read_u64(candidate_stripped);
             if first_word == 0 {
                 continue;
             }
 
             let code_cache = get_code_cache(candidate_stripped);
-            let code_cache_stripped = code_cache & 0x00FF_FFFF_FFFF_FFFF;
+            let code_cache_stripped = code_cache & PAC_STRIP_MASK;
             if code_cache_stripped != 0 && code_cache_stripped > 0x7000_0000 {
                 // 找到了 JitCodeCache*，调用 InvalidateAllMethods
                 type InvalidateAllFn = unsafe extern "C" fn(this: u64);
@@ -603,6 +704,30 @@ unsafe fn find_fixup_static_trampolines() -> u64 {
     dlsym_first_match(&candidates)
 }
 
+/// 查找 art::Thread::Current() 函数地址
+///
+/// 用于递归防护: 在 on_do_call_enter 中获取当前线程的 Thread*,
+/// 读取 ManagedStack 判断是否处于 callOriginal 递归中。
+unsafe fn find_thread_current() -> u64 {
+    libart_dlsym("_ZN3art6Thread7CurrentEv") as u64
+}
+
+/// 查找 ArtMethod::PrettyMethod 函数地址
+///
+/// 对标 Frida fixupArtQuickDeliverExceptionBug: 当 method==NULL 时
+/// PrettyMethod 会崩溃。Hook 此函数替换 NULL 为上次见到的非空 method。
+/// 优先成员函数版本，fallback 到静态函数版本。
+unsafe fn find_pretty_method() -> u64 {
+    // 成员函数版本: ArtMethod::PrettyMethod(bool)
+    let addr = libart_dlsym("_ZN3art9ArtMethod12PrettyMethodEb");
+    if !addr.is_null() {
+        return addr as u64;
+    }
+    // 静态函数版本: PrettyMethod(ArtMethod*, bool)
+    let addr = libart_dlsym("_ZN3art12PrettyMethodEPNS_9ArtMethodEb");
+    addr as u64
+}
+
 // ============================================================================
 // ART entrypoint classification helpers
 // ============================================================================
@@ -620,10 +745,19 @@ pub(super) fn is_art_quick_entrypoint(addr: u64, bridge: &ArtBridgeFunctions) ->
     if addr == 0 {
         return true;
     }
+    // ClassLinker trampoline 地址比较（对标 Frida isArtQuickEntrypoint）
     if addr == bridge.quick_generic_jni_trampoline
         || addr == bridge.quick_to_interpreter_bridge
         || addr == bridge.quick_resolution_trampoline
+        || addr == bridge.quick_imt_conflict_trampoline
         || addr == bridge.nterp_entry_point
+    {
+        return true;
+    }
+    // Thread TLS 中的真实 entrypoint 比较（trampoline 解析结果，0 表示无效跳过）
+    if (bridge.resolved_jni_entrypoint != 0 && addr == bridge.resolved_jni_entrypoint)
+        || (bridge.resolved_interpreter_bridge_entrypoint != 0 && addr == bridge.resolved_interpreter_bridge_entrypoint)
+        || (bridge.resolved_resolution_entrypoint != 0 && addr == bridge.resolved_resolution_entrypoint)
     {
         return true;
     }
@@ -916,4 +1050,456 @@ unsafe fn enumerate_class_fields(
 
     pop_frame(env, std::ptr::null_mut());
     Ok(results)
+}
+
+// ============================================================================
+// Instrumentation 偏移探测 — 对标 Frida tryDetectInstrumentationOffset/Pointer
+// ============================================================================
+
+/// Instrumentation 偏移规格
+pub(super) struct InstrumentationSpec {
+    /// Runtime.instrumentation_ 在 Runtime 结构体中的偏移
+    pub runtime_instrumentation_offset: usize,
+    /// Instrumentation.force_interpret_only_ 在 Instrumentation 结构体中的偏移 (固定=4)
+    pub force_interpret_only_offset: usize,
+    /// Instrumentation.deoptimization_enabled_ 偏移 (按 API level 查表, 可能不可用)
+    pub deoptimization_enabled_offset: Option<usize>,
+    /// true = 指针模式 (APEX >= 360_000_000), false = 嵌入模式
+    pub is_pointer_mode: bool,
+}
+
+/// 缓存的 Instrumentation 偏移探测结果
+static INSTRUMENTATION_SPEC: OnceLock<Option<InstrumentationSpec>> = OnceLock::new();
+
+/// 获取缓存的 Instrumentation 偏移规格（首次调用时探测）
+pub(super) fn get_instrumentation_spec() -> Option<&'static InstrumentationSpec> {
+    INSTRUMENTATION_SPEC.get_or_init(|| probe_instrumentation_spec()).as_ref()
+}
+
+/// 按 API level 返回 Instrumentation.deoptimization_enabled_ 偏移 (64-bit ARM64)
+/// 对标 Frida android.js 中的 deoptimizationEnabled 查找表 (pointerSize=8)
+///
+/// - API 21-31: 与 Frida 表一致的硬编码值
+/// - API 32 (Android 12L): Instrumentation 结构体与 API 31 相同，偏移不变
+/// - API 33+ (Android 13+): AOSP commit ba8600819d 将 EnableDeoptimization 变为 nop，
+///   deoptimization_enabled_ 字段已无实际作用。Frida 在 API 32+ 也没有提供偏移，
+///   而是通过检查 EnableDeoptimization 符号是否存在来决定是否使用该字段。
+///   这里对 API 33+ 返回 None，调用方应检查 EnableDeoptimization 符号可用性。
+fn get_deoptimization_enabled_offset() -> Option<usize> {
+    match get_android_api_level() {
+        21 | 22 => Some(224),
+        23 => Some(296),
+        24 | 25 => Some(344),
+        26 | 27 => Some(352),
+        28 => Some(392),
+        29 => Some(328),
+        30 | 31 | 32 => Some(336),
+        // API 33+: deoptimization_enabled_ 已无实际作用，返回 None
+        _ => None,
+    }
+}
+
+/// 反汇编 art::Runtime::DeoptimizeBootImage 提取 Runtime.instrumentation_ 的偏移。
+///
+/// 对标 Frida tryDetectInstrumentationOffset / tryDetectInstrumentationPointer:
+/// - 嵌入模式 (APEX < 360_000_000): 查找 ADD Xd, Xn, #imm 指令
+/// - 指针模式 (APEX >= 360_000_000): 查找 LDR Xt, [Xn, #imm] 指令
+///
+/// 仅支持 ARM64。
+pub(super) fn probe_instrumentation_spec() -> Option<InstrumentationSpec> {
+    // Step 1: dlsym 查找 art::Runtime::DeoptimizeBootImage
+    let sym_name = CString::new("_ZN3art7Runtime19DeoptimizeBootImageEv").unwrap();
+    let sym = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym_name.as_ptr()) };
+    if sym.is_null() {
+        output_message("[instrumentation] DeoptimizeBootImage 符号未找到");
+        return None;
+    }
+
+    // Step 2: 根据 APEX 版本判断解析模式
+    let apex_version = get_art_apex_version();
+    let is_pointer_mode = apex_version >= 360_000_000;
+    let deopt_offset = get_deoptimization_enabled_offset();
+
+    output_message(&format!(
+        "[instrumentation] DeoptimizeBootImage={:#x}, APEX={}, 模式={}",
+        sym as u64, apex_version, if is_pointer_mode { "指针" } else { "嵌入" }
+    ));
+
+    // Step 3: 扫描前 30 条 ARM64 指令（每条 4 字节）
+    let func_addr = sym as u64;
+    for i in 0..30u64 {
+        let insn_addr = func_addr + i * 4;
+        let insn = unsafe { *(insn_addr as *const u32) };
+
+        if is_pointer_mode {
+            // 指针模式: 查找 LDR Xt, [Xn, #imm] (64-bit unsigned offset)
+            // 编码: 1111 1001 01ii iiii iiii iinn nnnt tttt = 0xF940_0000
+            // mask: 0xFFC0_0000
+            if (insn & 0xFFC0_0000) == 0xF940_0000 {
+                let rt = insn & 0x1F;
+                let rn = (insn >> 5) & 0x1F;
+                let imm12 = ((insn >> 10) & 0xFFF) as usize;
+                let offset = imm12 * 8; // LDR X 的 imm12 按 8 缩放
+
+                // 排除 x0 作为目标（Frida: ops[0].value === 'x0' → skip）
+                // 基址必须是 x0（this 指针）
+                if rt == 0 || rn != 0 {
+                    continue;
+                }
+
+                if offset >= 0x100 && offset <= 0x400 {
+                    output_message(&format!(
+                        "[instrumentation] 指针模式: LDR x{}, [x{}, #{}]", rt, rn, offset
+                    ));
+                    return Some(InstrumentationSpec {
+                        runtime_instrumentation_offset: offset,
+                        force_interpret_only_offset: 4,
+                        deoptimization_enabled_offset: deopt_offset,
+                        is_pointer_mode: true,
+                    });
+                }
+            }
+        } else {
+            // 嵌入模式: 查找 ADD Xd, Xn, #imm (64-bit)
+            // SF=1, op=0, S=0 → 1001 0001
+            // shift=00: mask 0xFF80_0000, value 0x9100_0000
+            // shift=01: mask 0xFF80_0000, value 0x9140_0000
+            let masked = insn & 0xFF80_0000;
+            if masked == 0x9100_0000 || masked == 0x9140_0000 {
+                let rd = insn & 0x1F;
+                let rn = (insn >> 5) & 0x1F;
+                let imm12 = ((insn >> 10) & 0xFFF) as usize;
+                let shift = ((insn >> 22) & 0x3) as usize;
+                let offset = if shift == 1 { imm12 << 12 } else { imm12 };
+
+                // 排除 sp (x31) 操作
+                if rd == 31 || rn == 31 {
+                    continue;
+                }
+
+                if offset >= 0x100 && offset <= 0x400 {
+                    output_message(&format!(
+                        "[instrumentation] 嵌入模式: ADD x{}, x{}, #{}", rd, rn, offset
+                    ));
+                    return Some(InstrumentationSpec {
+                        runtime_instrumentation_offset: offset,
+                        force_interpret_only_offset: 4,
+                        deoptimization_enabled_offset: deopt_offset,
+                        is_pointer_mode: false,
+                    });
+                }
+            }
+        }
+    }
+
+    output_message("[instrumentation] 未找到 Instrumentation 偏移");
+    None
+}
+
+// ============================================================================
+// Runtime/JavaVM 共享辅助函数
+// ============================================================================
+
+/// 从 JNI_STATE 获取 Runtime* 和 java_vm_ 在 Runtime 中的偏移。
+///
+/// 扫描 Runtime 结构体查找 JavaVM* 指针位置。
+/// 返回 (runtime_addr, java_vm_offset)，如果获取失败返回 None。
+pub(super) unsafe fn find_runtime_java_vm() -> Option<(u64, usize)> {
+    let vm_ptr = {
+        let guard = JNI_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(state) => state.vm,
+            None => return None,
+        }
+    };
+
+    let runtime = get_runtime_addr()?;
+
+    refresh_mem_regions();
+
+    let vm_addr_stripped = (vm_ptr as u64) & PAC_STRIP_MASK;
+    let scan_start = 384usize;
+    let scan_end = scan_start + 800;
+
+    for offset in (scan_start..scan_end).step_by(8) {
+        let val = safe_read_u64(runtime + offset as u64);
+        let val_stripped = val & PAC_STRIP_MASK;
+        if val_stripped == vm_addr_stripped {
+            return Some((runtime, offset));
+        }
+    }
+
+    None
+}
+
+// ============================================================================
+// ArtRuntimeSpec — Runtime 内部偏移 (对标 Frida getArtRuntimeSpec)
+// ============================================================================
+
+/// ART Runtime 内部关键偏移
+pub(super) struct ArtRuntimeSpec {
+    /// Heap* 偏移
+    pub heap_offset: usize,
+    /// ThreadList* 偏移
+    pub thread_list_offset: usize,
+    /// InternTable* 偏移
+    pub intern_table_offset: usize,
+    /// ClassLinker* 偏移
+    pub class_linker_offset: usize,
+    /// JniIdManager* 偏移 (API 30+, None for older)
+    pub jni_id_manager_offset: Option<usize>,
+    /// Runtime 地址
+    pub runtime_addr: u64,
+}
+
+static ART_RUNTIME_SPEC: OnceLock<Option<ArtRuntimeSpec>> = OnceLock::new();
+
+/// 获取缓存的 ArtRuntimeSpec（首次调用时探测）
+pub(super) fn get_art_runtime_spec() -> Option<&'static ArtRuntimeSpec> {
+    ART_RUNTIME_SPEC.get_or_init(|| unsafe { probe_art_runtime_spec() }).as_ref()
+}
+
+/// 验证 classLinker 偏移是否正确（对标 Frida tryGetArtClassLinkerSpec）
+///
+/// 在 ClassLinker 结构体内部扫描 InternTable* 指针。
+/// 如果找到匹配，说明 classLinkerOffset 正确。
+unsafe fn verify_class_linker_offset(
+    runtime: u64,
+    class_linker_offset: usize,
+    intern_table_offset: usize,
+) -> bool {
+    const PTR_SIZE: usize = 8;
+
+    let cl_ptr = safe_read_u64(runtime + class_linker_offset as u64) & PAC_STRIP_MASK;
+    let it_ptr = safe_read_u64(runtime + intern_table_offset as u64) & PAC_STRIP_MASK;
+
+    if cl_ptr == 0 || it_ptr == 0 {
+        output_message(&format!(
+            "[art runtime] 交叉验证跳过: classLinker*={:#x}, internTable*={:#x}",
+            cl_ptr, it_ptr
+        ));
+        return false;
+    }
+
+    // 在 ClassLinker 内部扫描 InternTable* 指针（对标 Frida: startOffset=200, range=100*PTR_SIZE）
+    let scan_start = 200usize;
+    let scan_end = scan_start + 800;
+
+    for offset in (scan_start..scan_end).step_by(PTR_SIZE) {
+        let val = safe_read_u64(cl_ptr + offset as u64) & PAC_STRIP_MASK;
+        if val == it_ptr {
+            output_message(&format!(
+                "[art runtime] 交叉验证通过: 在 ClassLinker+{:#x} 找到 InternTable*={:#x}",
+                offset, it_ptr
+            ));
+            return true;
+        }
+    }
+
+    output_message(&format!(
+        "[art runtime] 交叉验证失败: ClassLinker({:#x}) 中未找到 InternTable*({:#x})",
+        cl_ptr, it_ptr
+    ));
+    false
+}
+
+/// 探测 ART Runtime 内部偏移（对标 Frida getArtRuntimeSpec / android.js:649-676）
+///
+/// 复用 find_runtime_java_vm 获取 Runtime 地址和 java_vm_ 偏移，
+/// 然后根据 API level 计算 classLinker_, internTable_, threadList_, heap_ 偏移。
+unsafe fn probe_art_runtime_spec() -> Option<ArtRuntimeSpec> {
+    let (runtime, java_vm_off) = match find_runtime_java_vm() {
+        Some(v) => v,
+        None => {
+            output_message("[art runtime] 无法获取 Runtime/java_vm_ 偏移");
+            return None;
+        }
+    };
+
+    let api_level = get_android_api_level();
+    let is_34_equiv = is_api_level_34_or_apex_equivalent();
+
+    const PTR_SIZE: usize = 8;
+
+    let candidates = compute_classlinker_candidates(java_vm_off);
+
+    // 对标 Frida tryGetArtClassLinkerSpec: 对每个候选进行 ClassLinker 内部结构验证
+    let mut class_linker_offset: Option<usize> = None;
+    for &candidate in &candidates {
+        let intern_table_candidate = candidate - PTR_SIZE;
+        if verify_class_linker_offset(runtime, candidate, intern_table_candidate) {
+            class_linker_offset = Some(candidate);
+            output_message(&format!(
+                "[art runtime] classLinker 候选 Runtime+{:#x} 验证通过", candidate
+            ));
+            break;
+        }
+        output_message(&format!(
+            "[art runtime] classLinker 候选 Runtime+{:#x} 验证失败，尝试下一个", candidate
+        ));
+    }
+
+    // fallback: 如果所有候选都验证失败，取第一个非空指针
+    let class_linker_offset = match class_linker_offset {
+        Some(off) => off,
+        None => {
+            output_message("[art runtime] 所有候选交叉验证失败，退回首个非空候选");
+            match candidates.iter().find(|&&off| {
+                let ptr = safe_read_u64(runtime + off as u64) & PAC_STRIP_MASK;
+                ptr != 0
+            }) {
+                Some(&off) => off,
+                None => {
+                    output_message("[art runtime] 无有效 classLinker 候选");
+                    return None;
+                }
+            }
+        }
+    };
+
+    // internTable_ = classLinker_ - 8 (对标 Frida android.js:663)
+    let intern_table_offset = class_linker_offset - PTR_SIZE;
+
+    // threadList_ = internTable_ - 8 (对标 Frida android.js:664)
+    let thread_list_offset = intern_table_offset - PTR_SIZE;
+
+    // heap_ 偏移 (对标 Frida android.js:666-676)
+    let heap_offset = if is_34_equiv {
+        // API 34+ / APEX equivalent: threadList - 9*8
+        thread_list_offset - 9 * PTR_SIZE
+    } else if api_level >= 24 {
+        thread_list_offset - 8 * PTR_SIZE
+    } else if api_level >= 23 {
+        thread_list_offset - 7 * PTR_SIZE
+    } else {
+        thread_list_offset - 4 * PTR_SIZE
+    };
+
+    // jniIdManager_ (API 30+): java_vm_ - 8 (对标 Frida)
+    let jni_id_manager_offset = if api_level >= 30 {
+        Some(java_vm_off - PTR_SIZE)
+    } else {
+        None
+    };
+
+    // 验证: classLinker 和 internTable 指针非空
+    let cl_ptr = safe_read_u64(runtime + class_linker_offset as u64) & PAC_STRIP_MASK;
+    let it_ptr = safe_read_u64(runtime + intern_table_offset as u64) & PAC_STRIP_MASK;
+
+    if cl_ptr == 0 {
+        output_message("[art runtime] classLinker 指针为空，探测失败");
+        return None;
+    }
+
+    output_message(&format!(
+        "[art runtime] 探测成功: heap={:#x}, threadList={:#x}, internTable={:#x}, classLinker={:#x}{}",
+        heap_offset, thread_list_offset, intern_table_offset, class_linker_offset,
+        if let Some(jni_off) = jni_id_manager_offset {
+            format!(", jniIdManager={:#x}", jni_off)
+        } else {
+            String::new()
+        }
+    ));
+    output_message(&format!(
+        "[art runtime] 验证: classLinker*={:#x}, internTable*={:#x}, Runtime={:#x}",
+        cl_ptr, it_ptr, runtime
+    ));
+
+    Some(ArtRuntimeSpec {
+        heap_offset,
+        thread_list_offset,
+        intern_table_offset,
+        class_linker_offset,
+        jni_id_manager_offset,
+        runtime_addr: runtime,
+    })
+}
+
+// ============================================================================
+// jniIdsIndirection 偏移探测 — 对标 Frida tryDetectJniIdsIndirectionOffset
+// ============================================================================
+
+/// 缓存的 jniIdsIndirection 偏移探测结果
+static JNI_IDS_INDIRECTION_OFFSET: OnceLock<Option<usize>> = OnceLock::new();
+
+/// 获取缓存的 jniIdsIndirection 偏移（首次调用时探测）
+pub(super) fn get_jni_ids_indirection_offset() -> Option<usize> {
+    *JNI_IDS_INDIRECTION_OFFSET.get_or_init(|| probe_jni_ids_indirection_offset())
+}
+
+/// 反汇编 art::Runtime::SetJniIdType 提取 Runtime.jni_ids_indirection_ 的偏移。
+///
+/// 对标 Frida tryDetectJniIdsIndirectionOffset:
+/// 扫描前 20 条指令，匹配以下模式之一:
+/// - LDR + CMP: LDR 读取 jni_ids_indirection_ 后跟 CMP 比较 → 取 LDR 的位移
+/// - STR + BL: STR 写入 jni_ids_indirection_ 后跟 BL 函数调用 → 取 STR 的位移
+pub(super) fn probe_jni_ids_indirection_offset() -> Option<usize> {
+    // dlsym 查找 art::Runtime::SetJniIdType
+    // 注意: 该符号在 Android 12+ 为 PROTECTED visibility，RTLD_DEFAULT 无法找到
+    // 必须使用 unrestricted dlsym (对标 Frida 的 linker API)
+    let sym = unsafe {
+        crate::jsapi::module::libart_dlsym("_ZN3art7Runtime12SetJniIdTypeENS_9JniIdTypeE")
+    };
+    if sym.is_null() {
+        output_message("[jniIds] SetJniIdType 符号未找到");
+        return None;
+    }
+
+    output_message(&format!("[jniIds] SetJniIdType={:#x}", sym as u64));
+
+    // 扫描前 20 条指令，查找 (LDR + CMP) 或 (STR + BL) 指令对
+    let func_addr = sym as u64;
+    let mut prev_insn: u32 = 0;
+    for i in 0..20u64 {
+        let insn = unsafe { *((func_addr + i * 4) as *const u32) };
+
+        if i > 0 {
+            // 当前是 CMP 且前一条是 LDR → 取 LDR 的 displacement
+            // CMP immediate: SF 11 10001 → mask 0x7F80_0000, Rd=11111 (XZR/WZR)
+            let is_cmp_imm = (insn & 0x7F80_0000) == 0x7100_0000 && ((insn & 0x1F) == 0x1F);
+            // CMP shifted register: SF 11 01011 → mask 0x7F20_0000 = 0x6B00_0000, Rd=11111
+            let is_cmp_reg = (insn & 0x7F20_0000) == 0x6B00_0000 && ((insn & 0x1F) == 0x1F);
+            let is_cmp = is_cmp_imm || is_cmp_reg;
+
+            // LDR (unsigned offset): 匹配 32-bit 和 64-bit
+            // jni_ids_indirection_ 是 C++ enum (通常 32-bit)，某些编译器生成 LDR W
+            // 64-bit: 0xFFC0_0000 == 0xF940_0000, scale=8
+            // 32-bit: 0xFFC0_0000 == 0xB940_0000, scale=4
+            let prev_is_ldr64 = (prev_insn & 0xFFC0_0000) == 0xF940_0000;
+            let prev_is_ldr32 = (prev_insn & 0xFFC0_0000) == 0xB940_0000;
+
+            if is_cmp && (prev_is_ldr64 || prev_is_ldr32) {
+                let imm12 = ((prev_insn >> 10) & 0xFFF) as usize;
+                let scale = if prev_is_ldr64 { 8 } else { 4 };
+                let offset = imm12 * scale;
+                output_message(&format!(
+                    "[jniIds] LDR+CMP 模式: offset={} ({}bit LDR)",
+                    offset, if prev_is_ldr64 { 64 } else { 32 }
+                ));
+                return Some(offset);
+            }
+
+            // 当前是 BL 且前一条是 STR → 取 STR 的 displacement
+            let is_bl = (insn & 0xFC00_0000) == 0x9400_0000;
+            // STR (unsigned offset): 匹配 32-bit 和 64-bit
+            let prev_is_str64 = (prev_insn & 0xFFC0_0000) == 0xF900_0000;
+            let prev_is_str32 = (prev_insn & 0xFFC0_0000) == 0xB900_0000;
+
+            if is_bl && (prev_is_str64 || prev_is_str32) {
+                let imm12 = ((prev_insn >> 10) & 0xFFF) as usize;
+                let scale = if prev_is_str64 { 8 } else { 4 };
+                let offset = imm12 * scale;
+                output_message(&format!(
+                    "[jniIds] STR+BL 模式: offset={} ({}bit STR)",
+                    offset, if prev_is_str64 { 64 } else { 32 }
+                ));
+                return Some(offset);
+            }
+        }
+
+        prev_insn = insn;
+    }
+
+    output_message("[jniIds] 未找到 jniIdsIndirection 偏移");
+    None
 }

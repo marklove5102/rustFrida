@@ -127,24 +127,47 @@ pub(super) unsafe extern "C" fn js_java_hook(
         }
     };
 
-    // 检查是否已 hook
+    // 检查是否已 hook — 如果是，直接替换回调（无需 unhook+rehook）
     init_java_registry();
     if with_registry(&JAVA_HOOK_REGISTRY, |r| r.contains_key(&art_method)).unwrap_or(false) {
-        return ffi::JS_ThrowInternalError(
-            ctx,
-            b"method already hooked (unhook first)\0".as_ptr() as *const _,
-        );
+        let new_callback_bytes = dup_callback_to_bytes(ctx, callback_arg.raw());
+
+        let old_callback_bytes = with_registry_mut(&JAVA_HOOK_REGISTRY, |registry| {
+            if let Some(hook_data) = registry.get_mut(&art_method) {
+                let old_bytes = hook_data.callback_bytes;
+                hook_data.callback_bytes = new_callback_bytes;
+                hook_data.ctx = ctx as usize;
+                Some(old_bytes)
+            } else {
+                None
+            }
+        })
+        .flatten();
+
+        if let Some(old_bytes) = old_callback_bytes {
+            let old_callback: ffi::JSValue =
+                std::ptr::read(old_bytes.as_ptr() as *const ffi::JSValue);
+            ffi::qjs_free_value(ctx, old_callback);
+        }
+
+        output_message(&format!(
+            "[java hook] 回调已替换: {}.{}{}",
+            class_name, method_name, actual_sig
+        ));
+
+        return JSValue::bool(true).raw();
     }
 
-    // 探测 entry_point 偏移（惰性，一次性）
-    let ep_offset = get_entry_point_offset(env, art_method);
-    let data_off = data_offset_for(ep_offset);
+    // 探测 ArtMethod 布局（惰性，一次性）
+    let spec = get_art_method_spec(env, art_method);
+    let ep_offset = spec.entry_point_offset;
+    let data_off = spec.data_offset;
 
     // ================================================================
     // Step 1: fetchArtMethod — 读取原始方法的 4 个关键字段
     // ================================================================
     let original_access_flags = std::ptr::read_volatile(
-        (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *const u32,
+        (art_method as usize + spec.access_flags_offset) as *const u32,
     );
     let original_data = std::ptr::read_volatile(
         (art_method as usize + data_off) as *const u64,
@@ -175,7 +198,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
     // ================================================================
     // Step 3: cloneArtMethod — 堆分配 backup clone (callOriginal 用)
     // ================================================================
-    let clone_size = ep_offset + 8;
+    let clone_size = spec.size;
     let clone_addr = {
         let ptr = libc::malloc(clone_size);
         if ptr.is_null() {
@@ -280,9 +303,9 @@ pub(super) unsafe extern "C" fn js_java_hook(
         let repl_flags = (original_access_flags
             & !(K_ACC_CRITICAL_NATIVE | K_ACC_FAST_NATIVE | K_ACC_NTERP_ENTRY_POINT_FAST_PATH))
             | K_ACC_NATIVE
-            | K_ACC_COMPILE_DONT_BOTHER;
+            | k_acc_compile_dont_bother();
         std::ptr::write_volatile(
-            (repl + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+            (repl + spec.access_flags_offset) as *mut u32,
             repl_flags,
         );
         std::ptr::write_volatile(
@@ -325,9 +348,9 @@ pub(super) unsafe extern "C" fn js_java_hook(
         if (original_access_flags & K_ACC_NATIVE) == 0 {
             removed_flags |= K_ACC_SKIP_ACCESS_CHECKS;
         }
-        let new_flags = (original_access_flags & !removed_flags) | K_ACC_COMPILE_DONT_BOTHER;
+        let new_flags = (original_access_flags & !removed_flags) | k_acc_compile_dont_bother();
         std::ptr::write_volatile(
-            (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+            (art_method as usize + spec.access_flags_offset) as *mut u32,
             new_flags,
         );
         output_message(&format!(
@@ -379,7 +402,7 @@ pub(super) unsafe extern "C" fn js_java_hook(
             libc::free(replacement_addr as *mut std::ffi::c_void);
             libc::free(clone_addr as *mut std::ffi::c_void);
             std::ptr::write_volatile(
-                (art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+                (art_method as usize + spec.access_flags_offset) as *mut u32,
                 original_access_flags,
             );
             if class_global_ref != 0 {
@@ -607,12 +630,13 @@ pub(super) unsafe extern "C" fn js_java_unhook(
             }
 
             // Step 3: 恢复全部 ArtMethod 字段
-            if let Some(&ep_offset) = ENTRY_POINT_OFFSET.get() {
-                let data_off = data_offset_for(ep_offset);
+            if let Some(spec) = ART_METHOD_SPEC.get() {
+                let ep_offset = spec.entry_point_offset;
+                let data_off = spec.data_offset;
 
                 // 恢复 access_flags_
                 std::ptr::write_volatile(
-                    (hook_data.art_method as usize + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+                    (hook_data.art_method as usize + spec.access_flags_offset) as *mut u32,
                     hook_data.original_access_flags,
                 );
 

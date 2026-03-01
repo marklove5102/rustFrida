@@ -12,7 +12,7 @@ use crate::context::JSContext;
 use crate::ffi;
 use crate::jsapi::console::output_message;
 use crate::jsapi::ptr::create_native_pointer;
-use crate::jsapi::util::is_addr_accessible;
+use crate::jsapi::util::{add_cfunction_to_object, is_addr_accessible};
 use crate::value::JSValue;
 use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
@@ -174,6 +174,52 @@ pub(crate) fn probe_libart_range() -> (u64, u64) {
             "[module] libart.so range: {:#x}-{:#x}, path: {:?}",
             range_start, range_end, found_path
         ));
+        (range_start, range_end)
+    }
+}
+
+/// 通过 /proc/self/maps 获取指定模块的地址范围 (start, end)。
+/// 返回 (0, 0) 表示未找到。
+pub(crate) fn probe_module_range(module_name: &str) -> (u64, u64) {
+    let maps = match std::fs::read_to_string("/proc/self/maps") {
+        Ok(s) => s,
+        Err(_) => return (0, 0),
+    };
+
+    let mut range_start: u64 = u64::MAX;
+    let mut range_end: u64 = 0;
+
+    for line in maps.lines() {
+        if !line.contains(module_name) {
+            continue;
+        }
+        // Verify the path field actually contains the module name
+        let path = match line.split_whitespace().last() {
+            Some(p) if p.contains(module_name) => p,
+            _ => continue,
+        };
+        let basename = path.rsplit('/').next().unwrap_or(path);
+        if basename != module_name {
+            continue;
+        }
+
+        let addr_part = match line.split_whitespace().next() {
+            Some(a) => a,
+            None => continue,
+        };
+        let mut parts = addr_part.split('-');
+        let start = parts.next().and_then(|s| u64::from_str_radix(s, 16).ok());
+        let end = parts.next().and_then(|s| u64::from_str_radix(s, 16).ok());
+
+        if let (Some(s), Some(e)) = (start, end) {
+            if s < range_start { range_start = s; }
+            if e > range_end { range_end = e; }
+        }
+    }
+
+    if range_start == u64::MAX {
+        (0, 0)
+    } else {
         (range_start, range_end)
     }
 }
@@ -1156,21 +1202,12 @@ pub fn register_module_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
     unsafe {
-        let module_obj = ffi::JS_NewObject(ctx.as_ptr());
+        let ctx_ptr = ctx.as_ptr();
+        let module_obj = ffi::JS_NewObject(ctx_ptr);
 
-        macro_rules! add_method {
-            ($name:expr, $func:expr, $argc:expr) => {
-                let cname = CString::new($name).unwrap();
-                let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), $argc);
-                let atom = ffi::JS_NewAtom(ctx.as_ptr(), cname.as_ptr());
-                ffi::qjs_set_property(ctx.as_ptr(), module_obj, atom, func_val);
-                ffi::JS_FreeAtom(ctx.as_ptr(), atom);
-            };
-        }
-
-        add_method!("findExportByName", js_module_find_export, 2);
-        add_method!("findBaseAddress", js_module_find_base, 1);
-        add_method!("enumerateModules", js_module_enumerate, 0);
+        add_cfunction_to_object(ctx_ptr, module_obj, "findExportByName", js_module_find_export, 2);
+        add_cfunction_to_object(ctx_ptr, module_obj, "findBaseAddress", js_module_find_base, 1);
+        add_cfunction_to_object(ctx_ptr, module_obj, "enumerateModules", js_module_enumerate, 0);
 
         global.set_property(ctx.as_ptr(), "Module", JSValue(module_obj));
     }

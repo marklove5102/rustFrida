@@ -1,5 +1,16 @@
 #![cfg(all(target_os = "android", target_arch = "aarch64"))]
 
+/// 生成 UnsafeCell 包装结构体，自动实现 Send + Sync。
+/// 用于将非 Send/Sync 类型安全地存入 OnceLock 全局变量。
+#[cfg(any(feature = "frida-gum", feature = "qbdi"))]
+macro_rules! define_sync_cell {
+    ($name:ident, $inner:ty) => {
+        struct $name(std::cell::UnsafeCell<$inner>);
+        unsafe impl Sync for $name {}
+        unsafe impl Send for $name {}
+    };
+}
+
 mod gumlibc;
 mod arm64_relocator;
 mod trace;
@@ -166,6 +177,25 @@ pub extern "C" fn hello_entry(string_table: *mut c_void) -> *mut c_void {
     null_mut()
 }
 
+/// 执行 JS 脚本并通过 EVAL:/EVAL_ERR: 协议返回结果。
+/// loadjs 和 jseval 共用此逻辑。
+#[cfg(feature = "quickjs")]
+fn eval_and_respond(script: &str, empty_err: &[u8]) {
+    if script.is_empty() {
+        write_stream(empty_err);
+    } else if !quickjs_loader::is_initialized() {
+        write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes());
+    } else {
+        match quickjs_loader::execute_script(script) {
+            Ok(result) => write_stream(format!("EVAL:{}\n", result).as_bytes()),
+            Err(e) => {
+                let e = e.replace('\n', "\r");
+                write_stream(format!("EVAL_ERR:{}\n", e).as_bytes());
+            }
+        }
+    }
+}
+
 fn process_cmd(command: &str) {
     match command.split_whitespace().next() {
         Some("trace") => {
@@ -217,47 +247,13 @@ fn process_cmd(command: &str) {
         },
         #[cfg(feature = "quickjs")]
         Some("loadjs") => {
-            // 同步执行并通过 EVAL:/EVAL_ERR: 协议返回结果
-            let script = command
-                .strip_prefix("loadjs")
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if script.is_empty() {
-                write_stream(b"EVAL_ERR:[quickjs] Error: empty script\n");
-            } else if !quickjs_loader::is_initialized() {
-                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes());
-            } else {
-                match quickjs_loader::execute_script(&script) {
-                    Ok(result) => write_stream(format!("EVAL:{}\n", result).as_bytes()),
-                    Err(e) => {
-                        let e = e.replace('\n', "\r");
-                        write_stream(format!("EVAL_ERR:{}\n", e).as_bytes());
-                    }
-                }
-            }
+            let script = command.strip_prefix("loadjs").unwrap_or("").trim();
+            eval_and_respond(script, b"EVAL_ERR:[quickjs] Error: empty script\n");
         },
         #[cfg(feature = "quickjs")]
         Some("jseval") => {
-            let expr = command
-                .strip_prefix("jseval")
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if expr.is_empty() {
-                write_stream("EVAL_ERR:[quickjs] 用法: jseval <expression>\n".as_bytes());
-            } else if !quickjs_loader::is_initialized() {
-                write_stream("EVAL_ERR:[quickjs] JS 引擎未初始化，请先执行 jsinit\n".as_bytes());
-            } else {
-                match quickjs_loader::execute_script(&expr) {
-                    Ok(result) => write_stream(format!("EVAL:{}\n", result).as_bytes()),
-                    Err(e) => {
-                        // 用 \r 替换 \n，避免多行错误（含堆栈）被 \n 协议分割
-                        let e = e.replace('\n', "\r");
-                        write_stream(format!("EVAL_ERR:{}\n", e).as_bytes());
-                    }
-                }
-            }
+            let expr = command.strip_prefix("jseval").unwrap_or("").trim();
+            eval_and_respond(expr, "EVAL_ERR:[quickjs] 用法: jseval <expression>\n".as_bytes());
         }
         #[cfg(feature = "quickjs")]
         Some("jscomplete") => {

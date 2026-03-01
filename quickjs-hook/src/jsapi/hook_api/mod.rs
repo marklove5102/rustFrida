@@ -6,8 +6,7 @@ mod registry;
 
 use crate::context::JSContext;
 use crate::ffi;
-use crate::value::JSValue;
-use std::ffi::CString;
+use crate::jsapi::util::add_cfunction_to_object;
 
 use functions::{js_call_native, js_hook, js_unhook};
 use registry::HOOK_REGISTRY;
@@ -17,21 +16,10 @@ pub fn register_hook_api(ctx: &JSContext) {
     let global = ctx.global_object();
 
     unsafe {
-        // Register hook(ptr, callback, stealth?)
-        let cname = CString::new("hook").unwrap();
-        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_hook), cname.as_ptr(), 3);
-        global.set_property(ctx.as_ptr(), "hook", JSValue(func_val));
-
-        // Register unhook()
-        let cname = CString::new("unhook").unwrap();
-        let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_unhook), cname.as_ptr(), 1);
-        global.set_property(ctx.as_ptr(), "unhook", JSValue(func_val));
-
-        // Register callNative(ptr, ...args) - call native function with 0-6 args
-        let cname = CString::new("callNative").unwrap();
-        let func_val =
-            ffi::qjs_new_cfunction(ctx.as_ptr(), Some(js_call_native), cname.as_ptr(), 1);
-        global.set_property(ctx.as_ptr(), "callNative", JSValue(func_val));
+        let g = global.raw();
+        add_cfunction_to_object(ctx.as_ptr(), g, "hook", js_hook, 3);
+        add_cfunction_to_object(ctx.as_ptr(), g, "unhook", js_unhook, 1);
+        add_cfunction_to_object(ctx.as_ptr(), g, "callNative", js_call_native, 1);
     }
 
     global.free(ctx.as_ptr());

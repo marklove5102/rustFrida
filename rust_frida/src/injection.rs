@@ -56,6 +56,19 @@ pub(crate) fn create_memfd_with_data(name: &str, data: &[u8]) -> Result<RawFd, S
     Ok(fd)
 }
 
+/// 在目标进程中分配内存并写入结构体，返回远程地址。
+fn alloc_and_write_struct<T>(pid: i32, malloc_addr: usize, data: &T, name: &str) -> Result<usize, String> {
+    let size = size_of::<T>();
+    let addr = call_target_function(pid, malloc_addr, &[size], None)
+        .map_err(|e| format!("分配{}内存失败: {}", name, e))?;
+    log_verbose!("分配{}内存", name);
+    log_verbose_addr!("地址", addr);
+    write_memory(pid, addr, data)?;
+    log_verbose!("{}写入成功", name);
+    log_verbose_addr!("地址", addr);
+    Ok(addr)
+}
+
 /// 注入 agent 到目标进程
 pub(crate) fn inject_to_process(
     pid: i32,
@@ -116,30 +129,9 @@ pub(crate) fn inject_to_process(
     log_verbose!("Shellcode写入成功");
     log_verbose_addr!("地址", shellcode_addr);
 
-    // 分配内存用于LibcOffsets结构体
-    let offsets_size = size_of::<LibcOffsets>();
-    let offsets_addr = call_target_function(pid, offsets.malloc, &[offsets_size], None)
-        .map_err(|e| format!("分配offsets内存失败: {}", e))?;
-
-    log_verbose!("分配offsets内存");
-    log_verbose_addr!("地址", offsets_addr);
-
-    // 写入LibcOffsets结构体
-    write_memory(pid, offsets_addr, &offsets)?;
-    log_verbose!("Offsets写入成功");
-    log_verbose_addr!("地址", offsets_addr);
-
-    let dloffset_size = size_of::<DlOffsets>();
-    let dloffset_addr = call_target_function(pid, offsets.malloc, &[dloffset_size], None)
-        .map_err(|e| format!("分配dloffsets内存失败: {}", e))?;
-
-    log_verbose!("分配dloffsets内存");
-    log_verbose_addr!("地址", dloffset_addr);
-
-    // 写入DlOffsets结构体
-    write_memory(pid, dloffset_addr, &dl_offsets)?;
-    log_verbose!("DlOffsets写入成功");
-    log_verbose_addr!("地址", dloffset_addr);
+    // 分配并写入 LibcOffsets / DlOffsets 结构体
+    let offsets_addr = alloc_and_write_struct(pid, offsets.malloc, &offsets, "offsets")?;
+    let dloffset_addr = alloc_and_write_struct(pid, offsets.malloc, &dl_offsets, "dloffsets")?;
 
     // 写入字符串表
     let string_table_addr = write_string_table(pid, offsets.malloc, string_overrides)?;

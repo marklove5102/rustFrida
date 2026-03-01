@@ -5,8 +5,7 @@ mod read;
 mod write;
 
 use crate::context::JSContext;
-use crate::ffi;
-use std::ffi::CString;
+use crate::jsapi::util::add_cfunction_to_object;
 
 use read::*;
 use write::*;
@@ -16,32 +15,23 @@ pub fn register_memory_api(ctx: &JSContext) {
     let global = ctx.global_object();
     let memory = ctx.new_object();
 
-    macro_rules! add_method {
-        ($name:expr, $func:expr, $argc:expr) => {
-            unsafe {
-                let cname = CString::new($name).unwrap();
-                let func_val = ffi::qjs_new_cfunction(ctx.as_ptr(), Some($func), cname.as_ptr(), $argc);
-                let prop_name = CString::new($name).unwrap();
-                let atom = ffi::JS_NewAtom(ctx.as_ptr(), prop_name.as_ptr());
-                ffi::qjs_set_property(ctx.as_ptr(), memory.raw(), atom, func_val);
-                ffi::JS_FreeAtom(ctx.as_ptr(), atom);
-            }
-        };
+    unsafe {
+        let ctx_ptr = ctx.as_ptr();
+        let obj = memory.raw();
+        add_cfunction_to_object(ctx_ptr, obj, "readU8", memory_read_u8, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "readU16", memory_read_u16, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "readU32", memory_read_u32, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "readU64", memory_read_u64, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "readPointer", memory_read_pointer, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "readCString", memory_read_cstring, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "readUtf8String", memory_read_utf8_string, 1);
+        add_cfunction_to_object(ctx_ptr, obj, "readByteArray", memory_read_byte_array, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "writeU8", memory_write_u8, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "writeU16", memory_write_u16, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "writeU32", memory_write_u32, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "writeU64", memory_write_u64, 2);
+        add_cfunction_to_object(ctx_ptr, obj, "writePointer", memory_write_pointer, 2);
     }
-
-    add_method!("readU8", memory_read_u8, 1);
-    add_method!("readU16", memory_read_u16, 1);
-    add_method!("readU32", memory_read_u32, 1);
-    add_method!("readU64", memory_read_u64, 1);
-    add_method!("readPointer", memory_read_pointer, 1);
-    add_method!("readCString", memory_read_cstring, 1);
-    add_method!("readUtf8String", memory_read_utf8_string, 1);
-    add_method!("readByteArray", memory_read_byte_array, 2);
-    add_method!("writeU8", memory_write_u8, 2);
-    add_method!("writeU16", memory_write_u16, 2);
-    add_method!("writeU32", memory_write_u32, 2);
-    add_method!("writeU64", memory_write_u64, 2);
-    add_method!("writePointer", memory_write_pointer, 2);
 
     // Set Memory on global object
     global.set_property(ctx.as_ptr(), "Memory", memory);

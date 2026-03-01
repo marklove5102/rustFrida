@@ -19,10 +19,14 @@
 use crate::ffi::hook as hook_ffi;
 use crate::jsapi::console::output_message;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
-use super::art_method::{ArtBridgeFunctions, try_invalidate_jit_cache, read_entry_point};
+use super::art_method::{ArtBridgeFunctions, ART_BRIDGE_FUNCTIONS, try_invalidate_jit_cache,
+                         read_entry_point, get_instrumentation_spec};
+use super::art_thread::{get_art_thread_spec, get_managed_stack_spec, ArtThreadSpec, ART_THREAD_SPEC};
 use super::callback::{get_replacement_method, is_replacement_method};
+use super::jni_core::{JniEnv, get_runtime_addr};
+use super::PAC_STRIP_MASK;
 
 // ============================================================================
 // wxshadow stealth 全局开关
@@ -49,6 +53,98 @@ pub(super) fn stealth_flag() -> i32 {
 }
 
 // ============================================================================
+// forced_interpret_only — 阻止 JIT 重编译被 hook 方法
+// ============================================================================
+
+/// 原始 forced_interpret_only_ 值 (0=未设置, 1=原始为0已设为1, 2=原始已为1)
+static FORCED_INTERPRET_SAVED: AtomicU8 = AtomicU8::new(0);
+
+/// 设置 Runtime.Instrumentation.forced_interpret_only_ = 1，阻止 JIT 重编译
+///
+/// 通过 InstrumentationSpec 获取偏移，从 JavaVM → Runtime → Instrumentation → field。
+/// 指针模式: Runtime[offset] 是 Instrumentation*，需先解引用
+/// 嵌入模式: Runtime + offset 就是 Instrumentation 结构体的起始地址
+unsafe fn set_forced_interpret_only() {
+    let spec = match get_instrumentation_spec() {
+        Some(s) => s,
+        None => {
+            output_message("[instrumentation] InstrumentationSpec 不可用，跳过 forced_interpret_only");
+            return;
+        }
+    };
+
+    let runtime = match get_runtime_addr() {
+        Some(r) => r,
+        None => {
+            output_message("[instrumentation] 无法获取 Runtime 地址，跳过 forced_interpret_only");
+            return;
+        }
+    };
+
+    let instrumentation_base = if spec.is_pointer_mode {
+        // 指针模式: Runtime[offset] 是 Instrumentation*
+        let ptr = *((runtime as usize + spec.runtime_instrumentation_offset) as *const u64);
+        let stripped = ptr & PAC_STRIP_MASK;
+        if stripped == 0 {
+            output_message("[instrumentation] Instrumentation 指针为空");
+            return;
+        }
+        stripped as usize
+    } else {
+        // 嵌入模式: Runtime + offset 直接是 Instrumentation
+        runtime as usize + spec.runtime_instrumentation_offset
+    };
+
+    let field_addr = (instrumentation_base + spec.force_interpret_only_offset) as *mut u8;
+    let old_val = std::ptr::read_volatile(field_addr);
+
+    if old_val == 0 {
+        std::ptr::write_volatile(field_addr, 1);
+        FORCED_INTERPRET_SAVED.store(1, Ordering::Relaxed);
+        output_message(&format!(
+            "[instrumentation] forced_interpret_only_ 已设置 (Instrumentation={:#x}, offset={})",
+            instrumentation_base, spec.force_interpret_only_offset
+        ));
+    } else {
+        FORCED_INTERPRET_SAVED.store(2, Ordering::Relaxed);
+        output_message("[instrumentation] forced_interpret_only_ 已为1，无需修改");
+    }
+}
+
+/// 恢复 forced_interpret_only_ 为原始值
+unsafe fn restore_forced_interpret_only() {
+    let saved = FORCED_INTERPRET_SAVED.load(Ordering::Relaxed);
+    if saved != 1 {
+        // 0=从未设置, 2=原始就是1 → 不需要恢复
+        return;
+    }
+
+    let spec = match get_instrumentation_spec() {
+        Some(s) => s,
+        None => return,
+    };
+
+    let runtime = match get_runtime_addr() {
+        Some(r) => r,
+        None => return,
+    };
+
+    let instrumentation_base = if spec.is_pointer_mode {
+        let ptr = *((runtime as usize + spec.runtime_instrumentation_offset) as *const u64);
+        let stripped = ptr & PAC_STRIP_MASK;
+        if stripped == 0 { return; }
+        stripped as usize
+    } else {
+        runtime as usize + spec.runtime_instrumentation_offset
+    };
+
+    let field_addr = (instrumentation_base + spec.force_interpret_only_offset) as *mut u8;
+    std::ptr::write_volatile(field_addr, 0);
+    FORCED_INTERPRET_SAVED.store(0, Ordering::Relaxed);
+    output_message("[instrumentation] forced_interpret_only_ 已恢复为 0");
+}
+
+// ============================================================================
 // ArtController 状态
 // ============================================================================
 
@@ -64,6 +160,8 @@ struct ArtControllerState {
     oat_header_hook_target: u64,
     /// FixupStaticTrampolines hook 地址 (0 表示未安装)
     fixup_hook_target: u64,
+    /// PrettyMethod hook 地址 (0 表示未安装)
+    pretty_method_hook_target: u64,
 }
 
 unsafe impl Send for ArtControllerState {}
@@ -86,8 +184,15 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
     ART_CONTROLLER.get_or_init(|| {
         output_message("[artController] 开始安装三层拦截矩阵...");
 
+        // 提前探测 ArtThreadSpec (递归防护 stack check 需要)
+        let _ = get_art_thread_spec(env as JniEnv);
+        let _ = get_managed_stack_spec();
+
         // B3: 自动清空 JIT 缓存 — 使已内联被 hook 方法的 JIT 代码失效
         unsafe { try_invalidate_jit_cache(); }
+
+        // B4: 设置 forced_interpret_only — 阻止 JIT 重编译
+        unsafe { set_forced_interpret_only(); }
 
         let mut shared_stub_targets = Vec::new();
         let mut do_call_targets = Vec::new();
@@ -282,13 +387,40 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
             }
         }
 
+        // --- Fix: hook PrettyMethod (NULL 指针崩溃防护) ---
+        let mut pretty_method_hook_target: u64 = 0;
+        if bridge.pretty_method != 0 {
+            let ret = unsafe {
+                hook_ffi::hook_attach(
+                    bridge.pretty_method as *mut std::ffi::c_void,
+                    Some(on_pretty_method_enter),
+                    None,
+                    std::ptr::null_mut(),
+                    stealth_flag(),
+                )
+            };
+            if ret == 0 {
+                pretty_method_hook_target = bridge.pretty_method;
+                output_message(&format!(
+                    "[artController] PrettyMethod hook 安装成功: {:#x}",
+                    bridge.pretty_method
+                ));
+            } else {
+                output_message(&format!(
+                    "[artController] PrettyMethod hook 安装失败: {:#x} (ret={})",
+                    bridge.pretty_method, ret
+                ));
+            }
+        }
+
         output_message(&format!(
-            "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}",
+            "[artController] 初始化完成: Layer1={}, Layer2={}, GC={}, OatHeader={}, Fixup={}, PrettyMethod={}",
             shared_stub_targets.len(),
             do_call_targets.len(),
             gc_hook_targets.len(),
             if oat_header_hook_target != 0 { "active" } else { "none" },
             if fixup_hook_target != 0 { "active" } else { "none" },
+            if pretty_method_hook_target != 0 { "active" } else { "none" },
         ));
 
         ArtControllerState {
@@ -297,6 +429,7 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
             gc_hook_targets,
             oat_header_hook_target,
             fixup_hook_target,
+            pretty_method_hook_target,
         }
     });
 }
@@ -305,7 +438,17 @@ pub(super) fn ensure_art_controller_initialized(bridge: &ArtBridgeFunctions, ep_
 // 回调函数
 // ============================================================================
 
-/// DoCall on_enter: 检查 x0 (ArtMethod*) 是否在 replacedMethods 中，有则替换
+/// 获取已缓存的 ArtThreadSpec（不需要 JNIEnv，仅从 OnceLock 读取）
+fn get_art_thread_spec_cached() -> Option<&'static ArtThreadSpec> {
+    match ART_THREAD_SPEC.get() {
+        Some(Some(spec)) => Some(spec),
+        _ => None,
+    }
+}
+
+/// DoCall on_enter: 检查 x0 (ArtMethod*) 是否在 replacedMethods 中，有则替换。
+/// 包含递归防护: 如果当前栈帧来自 callOriginal (managedStack 中已有 replacement)，
+/// 则跳过替换，让 original method 正常执行，防止无限递归。
 unsafe extern "C" fn on_do_call_enter(
     ctx_ptr: *mut hook_ffi::HookContext,
     _user_data: *mut std::ffi::c_void,
@@ -316,7 +459,120 @@ unsafe extern "C" fn on_do_call_enter(
     let ctx = &mut *ctx_ptr;
     let method = ctx.x[0];
     if let Some(replacement) = get_replacement_method(method) {
+        // 递归防护: 检查 managedStack 是否表明这是 callOriginal 发起的调用
+        if !should_replace_for_stack(replacement) {
+            return; // 递归情况，保持 original 不替换
+        }
         ctx.x[0] = replacement;
+    }
+}
+
+/// 递归防护: 检查当前线程的 ManagedStack 判断是否应该进行替换。
+///
+/// 对标 Frida find_replacement_method_from_quick_code():
+/// 1. 获取 Thread* via Thread::Current()
+/// 2. 读取 managed_stack.top_quick_frame
+/// 3. 如果 top_quick_frame != NULL → 正常调用，返回 true
+/// 4. 读取 managed_stack.link
+/// 5. 读取 link.top_quick_frame，解引用得到 ArtMethod*
+/// 6. 如果该 ArtMethod* == replacement → 递归，返回 false
+/// 7. 否则返回 true
+unsafe fn should_replace_for_stack(replacement: u64) -> bool {
+    // 获取 Thread::Current 函数指针
+    let bridge = match ART_BRIDGE_FUNCTIONS.get() {
+        Some(b) => b,
+        None => return true,
+    };
+    if bridge.thread_current == 0 {
+        return true; // 无法获取 Thread*，保守返回 true
+    }
+
+    // 调用 Thread::Current() 获取当前线程
+    type ThreadCurrentFn = unsafe extern "C" fn() -> u64;
+    let thread_current: ThreadCurrentFn = std::mem::transmute(bridge.thread_current);
+    let thread = thread_current();
+    let thread = thread & PAC_STRIP_MASK;
+    if thread == 0 {
+        return true;
+    }
+
+    // 获取 Thread 和 ManagedStack 布局偏移
+    // 注意: get_art_thread_spec 需要 JNIEnv，但此处已经在 hook 回调中，
+    // 且 spec 应该已经在初始化时被探测过。使用 OnceLock 缓存值。
+    let thread_spec = match get_art_thread_spec_cached() {
+        Some(spec) => spec,
+        None => return true,
+    };
+    let ms_spec = get_managed_stack_spec();
+
+    // 读取 managed_stack (嵌入在 Thread 结构体中)
+    let managed_stack = thread as usize + thread_spec.managed_stack_offset;
+
+    // 读取 top_quick_frame
+    let top_qf = std::ptr::read_volatile(
+        (managed_stack + ms_spec.top_quick_frame_offset) as *const u64,
+    );
+
+    if top_qf != 0 {
+        // top_quick_frame != NULL → 正常调用 (有 compiled frame)，执行替换
+        return true;
+    }
+
+    // top_quick_frame == NULL → 可能是从解释器进入的
+    // 读取 link_ (上一个 ManagedStack)
+    let link = std::ptr::read_volatile(
+        (managed_stack + ms_spec.link_offset) as *const u64,
+    );
+    let link = link & PAC_STRIP_MASK;
+    if link == 0 {
+        return true;
+    }
+
+    // 读取 link.top_quick_frame (可能有 TaggedQuickFrame 的 tag bit)
+    let link_tqf = std::ptr::read_volatile(
+        (link as usize + ms_spec.top_quick_frame_offset) as *const u64,
+    );
+    // Strip tag bit (bit 0): ART uses it as a tag for managed/JNI frames
+    let frame_ptr = (link_tqf & !1u64) & PAC_STRIP_MASK;
+    if frame_ptr == 0 {
+        return true;
+    }
+
+    // Dereference: top_quick_frame 指向栈上的 ArtMethod*
+    let art_method_on_stack = std::ptr::read_volatile(frame_ptr as *const u64);
+    let art_method_on_stack = art_method_on_stack & PAC_STRIP_MASK;
+
+    if art_method_on_stack == replacement {
+        // 栈上的方法就是 replacement → 这是 callOriginal 触发的递归调用
+        false
+    } else {
+        true
+    }
+}
+
+/// 上次见到的非空 ArtMethod* (PrettyMethod 防护用)
+static LAST_SEEN_ART_METHOD: AtomicU64 = AtomicU64::new(0);
+
+/// PrettyMethod on_enter 回调: 当 method (x0/this) 为 NULL 时替换为上次见到的非空 method。
+/// 对标 Frida fixupArtQuickDeliverExceptionBug: QuickDeliverException 中
+/// native 线程无 Java frame 时 method==NULL → PrettyMethod(NULL) → SIGSEGV。
+unsafe extern "C" fn on_pretty_method_enter(
+    ctx_ptr: *mut hook_ffi::HookContext,
+    _user_data: *mut std::ffi::c_void,
+) {
+    if ctx_ptr.is_null() {
+        return;
+    }
+    let ctx = &mut *ctx_ptr;
+    let method = ctx.x[0]; // ARM64: this (ArtMethod*) 在 x0
+    if method == 0 {
+        // NULL method → 替换为上次见到的非空 method 防止崩溃
+        let last = LAST_SEEN_ART_METHOD.load(Ordering::Relaxed);
+        if last != 0 {
+            ctx.x[0] = last;
+        }
+    } else {
+        LAST_SEEN_ART_METHOD.store(method, Ordering::Relaxed);
     }
 }
 
@@ -378,8 +634,8 @@ unsafe extern "C" fn on_get_oat_quick_method_header(
 unsafe fn synchronize_replacement_methods() {
     use super::art_method::ART_BRIDGE_FUNCTIONS;
     use super::callback::{JAVA_HOOK_REGISTRY, HookType};
-    use super::jni_core::{ART_METHOD_ACCESS_FLAGS_OFFSET, K_ACC_COMPILE_DONT_BOTHER,
-                          K_ACC_FAST_INTERP_TO_INTERP, ENTRY_POINT_OFFSET};
+    use super::jni_core::{ART_METHOD_SPEC, k_acc_compile_dont_bother,
+                          K_ACC_FAST_INTERP_TO_INTERP};
 
     let guard = match JAVA_HOOK_REGISTRY.lock() {
         Ok(g) => g,
@@ -390,10 +646,11 @@ unsafe fn synchronize_replacement_methods() {
         None => return,
     };
 
-    let ep_offset = match ENTRY_POINT_OFFSET.get() {
-        Some(&o) => o,
+    let spec = match ART_METHOD_SPEC.get() {
+        Some(s) => s,
         None => return,
     };
+    let ep_offset = spec.entry_point_offset;
 
     // 获取 nterp 和 interpreter_bridge 地址 (共享 stub 方法的 GC 同步用)
     let (nterp, interp_bridge) = match ART_BRIDGE_FUNCTIONS.get() {
@@ -414,15 +671,16 @@ unsafe fn synchronize_replacement_methods() {
         }
 
         // --- flags 修复: 确保 kAccCompileDontBother 在 + kAccFastInterpreterToInterpreterInvoke 不在 ---
+        let cdontbother = k_acc_compile_dont_bother();
         let flags = std::ptr::read_volatile(
-            (art_method + ART_METHOD_ACCESS_FLAGS_OFFSET) as *const u32,
+            (art_method + spec.access_flags_offset) as *const u32,
         );
-        let need_fix = (flags & K_ACC_COMPILE_DONT_BOTHER) == 0
+        let need_fix = (cdontbother != 0 && (flags & cdontbother) == 0)
             || (flags & K_ACC_FAST_INTERP_TO_INTERP) != 0;
         if need_fix {
-            let fixed = (flags | K_ACC_COMPILE_DONT_BOTHER) & !K_ACC_FAST_INTERP_TO_INTERP;
+            let fixed = (flags | cdontbother) & !K_ACC_FAST_INTERP_TO_INTERP;
             std::ptr::write_volatile(
-                (art_method + ART_METHOD_ACCESS_FLAGS_OFFSET) as *mut u32,
+                (art_method + spec.access_flags_offset) as *mut u32,
                 fixed,
             );
         }
@@ -473,6 +731,9 @@ unsafe fn synchronize_replacement_methods() {
 /// 移除 Layer 1 (共享 stub 路由 hook) 和 Layer 2 (DoCall hook)。
 /// 调用路径: cleanup_java_hooks() → cleanup_art_controller()
 pub(super) fn cleanup_art_controller() {
+    // 恢复 instrumentation 状态 (在移除 hooks 之前)
+    unsafe { restore_forced_interpret_only(); }
+
     let state = match ART_CONTROLLER.get() {
         Some(s) => s,
         None => return, // 从未初始化，无需清理
@@ -523,6 +784,17 @@ pub(super) fn cleanup_art_controller() {
         output_message(&format!(
             "[artController] FixupStaticTrampolines hook 已移除: {:#x}",
             state.fixup_hook_target
+        ));
+    }
+
+    // 移除 PrettyMethod hook
+    if state.pretty_method_hook_target != 0 {
+        unsafe {
+            hook_ffi::hook_remove(state.pretty_method_hook_target as *mut std::ffi::c_void);
+        }
+        output_message(&format!(
+            "[artController] PrettyMethod hook 已移除: {:#x}",
+            state.pretty_method_hook_target
         ));
     }
 
