@@ -26,6 +26,7 @@ typedef struct {
     uintptr_t malloc;      // 用于分配内存
     uintptr_t free;        // 用于释放内存
     uintptr_t socketpair;  // 用于创建已连接的套接字对
+    uintptr_t read;        // 用于接收 agent blob
     uintptr_t write;       // 用于发送数据
     uintptr_t close;       // 用于关闭套接字
     uintptr_t mmap;        // 用于内存映射
@@ -52,8 +53,10 @@ typedef struct {
 
 // 定义函数指针类型
 typedef void (*free_t)(void*);
+typedef ssize_t (*read_t)(int, void*, size_t);
 typedef ssize_t (*write_t)(int, const void*, size_t);
 typedef int (*close_t)(int);
+typedef int (*memfd_create_t)(const char*, unsigned int);
 
 // android_dlopen_ext for fd-based loading (bypasses SELinux path check)
 #define ANDROID_DLEXT_USE_LIBRARY_FD 0x10
@@ -74,11 +77,33 @@ typedef void* (*dlsym_t)(void*, const char*);
 typedef char* (*dlerror_t)();
 typedef size_t (*strlen_t)(const char *);
 
+static ssize_t read_full(read_t read_fn, int fd, void* buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = read_fn(fd, (char*)buf + done, len - done);
+        if (n <= 0) return n;
+        done += (size_t)n;
+    }
+    return (ssize_t)done;
+}
+
+static ssize_t write_full(write_t write_fn, int fd, const void* buf, size_t len) {
+    size_t done = 0;
+    while (done < len) {
+        ssize_t n = write_fn(fd, (const char*)buf + done, len - done);
+        if (n <= 0) return n;
+        done += (size_t)n;
+    }
+    return (ssize_t)done;
+}
+
 int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, AgentArgs* agent_args) {
     // 定义函数指针
     free_t free = (free_t)offsets->free;
+    read_t read = (read_t)offsets->read;
     write_t write = (write_t)offsets->write;
     close_t close = (close_t)offsets->close;
+    memfd_create_t memfd_create = (memfd_create_t)offsets->memfd_create;
     android_dlopen_ext_t android_dlopen_ext = (android_dlopen_ext_t)dl->android_dlopen_ext;
     dlsym_t dlsym = (dlsym_t)dl->dlsym;
     dlerror_t dlerror = (dlerror_t)dl->dlerror;
@@ -97,7 +122,57 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     size_t dlsym_err_len = table->dlsym_err_len - 1; // 减去 NULL 结尾
 
     int ctrl_fd = agent_args->ctrl_fd;
-    int memfd = agent_args->agent_memfd;
+    int memfd;
+
+    char memfd_name[7];
+    memfd_name[0] = 'w'; memfd_name[1] = 'w'; memfd_name[2] = 'b';
+    memfd_name[3] = '_'; memfd_name[4] = 's'; memfd_name[5] = 'o';
+    memfd_name[6] = '\0';
+    memfd = memfd_create(memfd_name, 0);
+    if (memfd < 0) {
+        close(ctrl_fd);
+        free(offsets);
+        free(dl);
+        free(table);
+        free(agent_args);
+        return -8;
+    }
+
+    uint64_t agent_size = 0;
+    if (read_full(read, ctrl_fd, &agent_size, sizeof(agent_size)) != (ssize_t)sizeof(agent_size)) {
+        close(memfd);
+        close(ctrl_fd);
+        free(offsets);
+        free(dl);
+        free(table);
+        free(agent_args);
+        return -9;
+    }
+
+    char buf[8192];
+    uint64_t remaining = agent_size;
+    while (remaining > 0) {
+        size_t chunk = remaining > sizeof(buf) ? sizeof(buf) : (size_t)remaining;
+        if (read_full(read, ctrl_fd, buf, chunk) != (ssize_t)chunk) {
+            close(memfd);
+            close(ctrl_fd);
+            free(offsets);
+            free(dl);
+            free(table);
+            free(agent_args);
+            return -10;
+        }
+        if (write_full(write, memfd, buf, chunk) != (ssize_t)chunk) {
+            close(memfd);
+            close(ctrl_fd);
+            free(offsets);
+            free(dl);
+            free(table);
+            free(agent_args);
+            return -11;
+        }
+        remaining -= chunk;
+    }
 
     // 使用 android_dlopen_ext fd-based 加载，绕过 SELinux path 检查
     // 手动清零 (shellcode 不能调用 memset)
@@ -165,4 +240,3 @@ int shellcode_entry(LibcOffsets* offsets, DlOffsets* dl, StringTable* table, Age
     // 不关闭 ctrl_fd（agent 线程继续使用）
     return 1;
 }
-

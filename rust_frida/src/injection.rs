@@ -13,7 +13,6 @@ use crate::process::{
 use crate::types::{write_string_table, AgentArgs, DlOffsets, LibcOffsets};
 use crate::{log_error, log_info, log_success, log_verbose, log_verbose_addr, log_warn};
 
-// 嵌入loader.bin
 pub(crate) const SHELLCODE: &[u8] = include_bytes!("../../loader/build/loader.bin");
 
 #[cfg(debug_assertions)]
@@ -23,6 +22,9 @@ pub(crate) const AGENT_SO: &[u8] =
 #[cfg(not(debug_assertions))]
 pub(crate) const AGENT_SO: &[u8] =
     include_bytes!("../../target/aarch64-linux-android/release/libagent.so");
+
+#[cfg(feature = "qbdi")]
+pub(crate) const QBDI_HELPER_SO: &[u8] = include_bytes!(env!("QBDI_HELPER_SO_PATH"));
 
 /// 最小化空 SO（无符号、无 .init_array），用于隔离 memfd 映射检测
 const EMPTY_SO: &[u8] = include_bytes!("../../loader/build/empty.so");
@@ -162,6 +164,48 @@ impl Drop for InjectionGuard {
     }
 }
 
+fn spawn_agent_blob_sender(host_fd: RawFd) -> Result<std::thread::JoinHandle<Result<(), String>>, String> {
+    let fd = unsafe { libc::dup(host_fd) };
+    if fd < 0 {
+        return Err(format!("dup(host_fd={}) 失败: {}", host_fd, std::io::Error::last_os_error()));
+    }
+
+    let payload = AGENT_SO.to_vec();
+    Ok(std::thread::spawn(move || {
+        let len = (payload.len() as u64).to_le_bytes();
+        let mut written = 0usize;
+        while written < len.len() {
+            let n = unsafe { libc_write(fd, len[written..].as_ptr() as *const c_void, len.len() - written) };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe { close(fd) };
+                return Err(format!("发送 agent 长度失败: {}", err));
+            }
+            written += n as usize;
+        }
+
+        let mut written = 0usize;
+        while written < payload.len() {
+            let n = unsafe {
+                libc_write(
+                    fd,
+                    payload[written..].as_ptr() as *const c_void,
+                    payload.len() - written,
+                )
+            };
+            if n < 0 {
+                let err = std::io::Error::last_os_error();
+                unsafe { close(fd) };
+                return Err(format!("发送 agent.so 失败: {}", err));
+            }
+            written += n as usize;
+        }
+
+        unsafe { close(fd) };
+        Ok(())
+    }))
+}
+
 /// 注入 agent 到目标进程，返回 host_fd（socketpair 的 host 端）
 pub(crate) fn inject_to_process(
     pid: i32,
@@ -206,43 +250,8 @@ pub(crate) fn inject_to_process(
     let _ = call_target_function(pid, offsets.close, &[fd0 as usize], None);
     log_verbose!("目标进程 fd0={} 已关闭，fd1={} 保留给 agent", fd0, fd1);
 
-    // 4. 在目标进程中创建 memfd，pidfd_getfd 提取到 host，写入 agent.so
-    let target_memfd = create_and_fill_memfd(pid, &offsets, AGENT_SO, "agent.so")?;
-
     // === 分配并写入注入数据 ===
     log_verbose!("开始分配内存");
-
-    // 分配内存用于shellcode
-    let page_size = 4096;
-    let shellcode_len = ((SHELLCODE.len() + page_size - 1) / page_size) * page_size;
-    let mmap_prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-    let mmap_flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
-    let shellcode_addr = call_target_function(
-        pid,
-        offsets.mmap,
-        &[
-            0, // addr = NULL，让内核分配
-            shellcode_len,
-            mmap_prot as usize,
-            mmap_flags as usize,
-            !0usize, // fd = -1
-            0,       // offset = 0
-        ],
-        None,
-    )
-    .map_err(|e| format!("调用 mmap 失败: {}", e))?;
-
-    log_verbose!("分配shellcode内存");
-    log_verbose_addr!("地址", shellcode_addr);
-
-    // 写入shellcode
-    write_bytes(pid, shellcode_addr, SHELLCODE)?;
-    log_verbose!("Shellcode写入成功");
-    log_verbose_addr!("地址", shellcode_addr);
-
-    // 分配并写入 LibcOffsets / DlOffsets 结构体
-    let offsets_addr = alloc_and_write_struct(pid, offsets.malloc, &offsets, "offsets")?;
-    let dloffset_addr = alloc_and_write_struct(pid, offsets.malloc, &dl_offsets, "dloffsets")?;
 
     // 写入字符串表
     let string_table_addr = write_string_table(pid, offsets.malloc, string_overrides)?;
@@ -253,59 +262,82 @@ pub(crate) fn inject_to_process(
     let agent_args = AgentArgs {
         table: string_table_addr as u64,
         ctrl_fd: fd1,
-        agent_memfd: target_memfd,
+        agent_memfd: -1,
     };
     let agent_args_addr = alloc_and_write_struct(pid, offsets.malloc, &agent_args, "AgentArgs")?;
 
-    // 使用 call_target_function 调用 shellcode（4 参数）
+    let page_size = 4096;
+    let shellcode_len = ((SHELLCODE.len() + page_size - 1) / page_size) * page_size;
+    let mmap_prot = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
+    let mmap_flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS;
+    let shellcode_addr = call_target_function(
+        pid,
+        offsets.mmap,
+        &[0, shellcode_len, mmap_prot as usize, mmap_flags as usize, !0usize, 0],
+        None,
+    )
+    .map_err(|e| format!("调用 mmap 失败: {}", e))?;
+    log_verbose!("分配shellcode内存");
+    log_verbose_addr!("地址", shellcode_addr);
+
+    write_bytes(pid, shellcode_addr, SHELLCODE)?;
+    log_verbose!("Shellcode写入成功");
+    log_verbose_addr!("地址", shellcode_addr);
+
+    let offsets_addr = alloc_and_write_struct(pid, offsets.malloc, &offsets, "offsets")?;
+    let dloffset_addr = alloc_and_write_struct(pid, offsets.malloc, &dl_offsets, "dloffsets")?;
+    let sender = spawn_agent_blob_sender(host_fd)?;
+
     match call_target_function(
         pid,
         shellcode_addr,
-        &[
-            offsets_addr,
-            dloffset_addr,
-            string_table_addr,
-            agent_args_addr,
-        ],
+        &[offsets_addr, dloffset_addr, string_table_addr, agent_args_addr],
         None,
     ) {
         Ok(return_value) => {
-            // shellcode_entry 返回 int (32位)，ARM64 X0 高 32 位为 0，
-            // 需先截断为 i32 再符号扩展，否则 -3 变成 0x00000000FFFFFFFD
             let ret = return_value as u32 as i32 as isize;
             log_verbose!("Shellcode 执行完成，返回值: 0x{:x}", ret);
-
-            // 检查 shellcode 返回值（1 = 成功，负数 = 失败）
             if ret != 1 {
                 let reason = match ret {
                     -3 => "（已废弃，不应出现）",
                     -5 => "android_dlopen_ext 失败（SO 加载失败）",
                     -6 => "pthread_create 失败（无法创建 agent 线程）",
                     -7 => "dlsym 失败（未找到 hello_entry 符号）",
+                    -8 => "loader memfd_create 失败",
+                    -9 => "loader 读取 agent 长度失败",
+                    -10 => "loader 接收 agent blob 失败",
+                    -11 => "loader 写入 memfd 失败",
                     _ => "未知错误",
                 };
-                // 清理 shellcode 内存
-                let _ = call_target_function(
-                    pid,
-                    offsets.munmap,
-                    &[shellcode_addr, shellcode_len],
-                    None,
-                );
+                let _ = call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None);
                 let _ = ptrace::detach(Pid::from_raw(pid), None);
                 let fd = guard.into_fd();
                 unsafe { close(fd) };
                 return Err(format!("Shellcode 执行失败 ({}): {}", ret, reason));
             }
 
-            // 释放shellcode内存
+            match sender.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    let _ = ptrace::detach(Pid::from_raw(pid), None);
+                    let fd = guard.into_fd();
+                    unsafe { close(fd) };
+                    return Err(e);
+                }
+                Err(_) => {
+                    let _ = ptrace::detach(Pid::from_raw(pid), None);
+                    let fd = guard.into_fd();
+                    unsafe { close(fd) };
+                    return Err("agent 发送线程 panic".to_string());
+                }
+            }
+
             log_verbose!("正在释放shellcode内存...");
-            match call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None)
-            {
+            match call_target_function(pid, offsets.munmap, &[shellcode_addr, shellcode_len], None) {
                 Ok(_) => log_verbose!("Shellcode内存释放成功"),
                 Err(e) => log_error!("释放shellcode内存失败: {}", e),
             }
 
-            // detach 目标进程（guard.into_fd 阻止自动 detach）
             if let Err(e) = ptrace::detach(Pid::from_raw(pid), None) {
                 log_error!("分离目标进程失败: {}", e);
             } else {
@@ -316,7 +348,6 @@ pub(crate) fn inject_to_process(
         Err(e) => {
             log_error!("执行 shellcode 失败: {}", e);
             log_warn!("暂停目标进程，等待调试器附加...");
-            // 特殊处理：关闭 host_fd 但发 SIGSTOP（不走 guard 默认的 detach）
             let fd = guard.into_fd();
             unsafe { close(fd) };
             let _ = ptrace::cont(Pid::from_raw(pid), Some(Signal::SIGSTOP));
@@ -467,6 +498,31 @@ fn dlopen_agent_via_ptrace(
     offsets: &LibcOffsets,
     dl_offsets: &DlOffsets,
 ) -> Result<usize, String> {
+    // 在目标进程中先通过 dlopen+dlsym 解析真实 android_dlopen_ext 地址，
+    // 避免用本进程 libdl 偏移平移后落到错误地址。
+    let libdl_name = b"libdl.so\0";
+    let libdl_name_addr = call_target_function(pid, offsets.malloc, &[libdl_name.len()], None)
+        .map_err(|e| format!("分配 libdl 名称失败: {}", e))?;
+    write_bytes(pid, libdl_name_addr, libdl_name)?;
+    let libdl_handle = call_target_function(pid, dl_offsets.dlopen, &[libdl_name_addr, 2], None)
+        .map_err(|e| format!("调用 dlopen(libdl.so) 失败: {}", e))?;
+    let _ = call_target_function(pid, offsets.free, &[libdl_name_addr], None);
+    if libdl_handle == 0 {
+        return Err("dlopen(libdl.so) 返回 NULL".to_string());
+    }
+
+    let sym_name = b"android_dlopen_ext\0";
+    let sym_name_addr = call_target_function(pid, offsets.malloc, &[sym_name.len()], None)
+        .map_err(|e| format!("分配 android_dlopen_ext 符号名失败: {}", e))?;
+    write_bytes(pid, sym_name_addr, sym_name)?;
+    let android_dlopen_ext_addr = call_target_function(pid, dl_offsets.dlsym, &[libdl_handle, sym_name_addr], None)
+        .map_err(|e| format!("调用 dlsym(android_dlopen_ext) 失败: {}", e))?;
+    let _ = call_target_function(pid, offsets.free, &[sym_name_addr], None);
+    if android_dlopen_ext_addr == 0 {
+        return Err("dlsym(android_dlopen_ext) 返回 NULL".to_string());
+    }
+    log_verbose!("目标进程 android_dlopen_ext = 0x{:x}", android_dlopen_ext_addr);
+
     // 在目标进程中分配并写入 lib name 字符串
     let lib_name = b"agent.so\0";
     let name_addr = call_target_function(pid, offsets.malloc, &[lib_name.len()], None)
@@ -482,14 +538,9 @@ fn dlopen_agent_via_ptrace(
     let ext_info_addr =
         alloc_and_write_struct(pid, offsets.malloc, &ext_info, "android_dlextinfo")?;
 
-    // 调用 android_dlopen_ext(name, RTLD_NOW=2, &ext_info)
-    let handle = call_target_function(
-        pid,
-        dl_offsets.android_dlopen_ext,
-        &[name_addr, 2, ext_info_addr],
-        None,
-    )
-    .map_err(|e| format!("调用 android_dlopen_ext 失败: {}", e))?;
+    // 调用目标进程里真实解析出来的 android_dlopen_ext(name, RTLD_NOW=2, &ext_info)
+    let handle = call_target_function(pid, android_dlopen_ext_addr, &[name_addr, 2, ext_info_addr], None)
+        .map_err(|e| format!("调用 android_dlopen_ext 失败: {}", e))?;
 
     // 释放临时内存
     let _ = call_target_function(pid, offsets.free, &[name_addr], None);
@@ -522,7 +573,7 @@ fn dlopen_agent_via_ptrace(
                 }
             }
         }
-        return Err("android_dlopen_ext 返回 NULL（dlopen 失败）".to_string());
+        return Err("android_dlopen_ext 返回 NULL".to_string());
     }
 
     log_success!("android_dlopen_ext 成功，handle=0x{:x}", handle);

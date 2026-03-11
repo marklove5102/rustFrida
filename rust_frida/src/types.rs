@@ -2,7 +2,7 @@
 
 use libc::{
     c_void, close, dlerror, dlopen, dlsym, free, malloc, memfd_create, mmap, munmap,
-    pthread_create, pthread_detach, socketpair, strlen, write,
+    pthread_create, pthread_detach, read, socketpair, strlen, write,
 };
 use paste::paste;
 use std::os::raw::c_int;
@@ -154,6 +154,7 @@ define_libc_functions!(
     malloc,       // 用于分配内存
     free,         // 用于释放内存
     socketpair,   // 用于创建已连接的套接字对
+    read,         // 用于从 socket 读取 agent blob
     write,        // 用于发送数据
     close,        // 用于关闭套接字
     mmap,         // 用于内存映射
